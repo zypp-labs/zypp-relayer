@@ -1,0 +1,112 @@
+# ZRN Runbook
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `NODE_ENV` | No | development | development \| test \| production |
+| `PORT` | No | 3000 | API server port |
+| `LOG_LEVEL` | No | info | trace, debug, info, warn, error |
+| `DATABASE_URL` | Yes | - | PostgreSQL connection string |
+| `REDIS_URL` | No | redis://localhost:6379 | Redis connection URL |
+| `RPC_URLS` | Yes | - | Comma-separated Solana RPC URLs (e.g. https://api.devnet.solana.com) |
+| `RPC_CONFIRMATION_COMMITMENT` | No | confirmed | processed, confirmed, finalized |
+| `RPC_CONFIRMATION_TIMEOUT_MS` | No | 60000 | Max ms to wait for confirmation |
+| `RATE_LIMIT_MAX` | No | 100 | Max requests per window per IP |
+| `RATE_LIMIT_WINDOW_MS` | No | 60000 | Rate limit window (ms) |
+| `BULL_CONCURRENCY` | No | 5 | Worker concurrency per process |
+| `BULL_MAX_ATTEMPTS` | No | 5 | Max retry attempts per job |
+| `BULL_BACKOFF_MS` | No | 1000 | Initial backoff (exponential) |
+
+## Local development
+
+1. **PostgreSQL and Redis**
+
+   Run Postgres and Redis (e.g. Docker):
+
+   ```bash
+   docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
+   docker run -d -p 6379:6379 redis:7
+   ```
+
+2. **Environment**
+
+   Create `.env`:
+
+   ```
+   DATABASE_URL=postgresql://postgres:postgres@localhost:5432/zrn
+   REDIS_URL=redis://localhost:6379
+   RPC_URLS=https://api.devnet.solana.com
+   ```
+
+3. **Migrations**
+
+   ```bash
+   npm run migrate
+   ```
+
+4. **Start API and worker**
+
+   Terminal 1:
+
+   ```bash
+   npm run dev:api
+   ```
+
+   Terminal 2:
+
+   ```bash
+   npm run dev:worker
+   ```
+
+5. **Submit a transaction**
+
+   ```bash
+   curl -X POST http://localhost:3000/v1/transactions \
+     -H "Content-Type: application/json" \
+     -d '{"transaction":"<base64-serialized-signed-tx>"}'
+   ```
+
+   Poll status:
+
+   ```bash
+   curl http://localhost:3000/v1/transactions/<jobId>
+   ```
+
+## Devnet RPC
+
+For devnet, use `RPC_URLS=https://api.devnet.solana.com`. For higher throughput or failover, add multiple URLs separated by commas. The worker will try the next URL on timeout or RPC errors.
+
+## Benchmark
+
+```bash
+# Ensure API and worker are running; use a funded devnet keypair
+export API_URL=http://localhost:3000
+export KEYPAIR_PATH=path/to/devnet-keypair.json
+export BENCH_N=20
+npm run bench
+```
+
+## Deploy (fly.io)
+
+The API is deployed to Fly.io. The worker can run on the same app (multiple processes) or a separate Fly app.
+
+1. **Create app and set secrets**
+
+   ```bash
+   fly apps create zrn-api   # or use existing
+   fly secrets set DATABASE_URL="..." REDIS_URL="..." RPC_URLS="https://api.devnet.solana.com"
+   ```
+
+2. **Deploy**
+
+   ```bash
+   fly deploy
+   ```
+
+3. **Scale**
+
+   - API: `fly scale count 1` (or more for API-only replicas).
+   - Worker: run a separate process (e.g. `fly scale count 1` with a worker process) or use a second Fly app that runs the worker command.
+
+See `fly.toml` for the API service definition.

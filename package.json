@@ -1,0 +1,40 @@
+{
+  "name": "zrn",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/api/index.js",
+    "worker": "node dist/worker/index.js",
+    "dev:api": "tsx watch src/api/index.ts",
+    "dev:worker": "tsx watch src/worker/index.ts",
+    "migrate": "tsx src/store/run-migrate.ts",
+    "bench": "tsx scripts/bench.ts",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "^10.1.0",
+    "@solana/web3.js": "^1.95.0",
+    "bullmq": "^5.25.0",
+    "fastify": "^5.1.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.5",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "eslint": "^9.16.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

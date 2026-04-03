@@ -1,0 +1,118 @@
+openapi: 3.0.3
+info:
+  title: ZRN API
+  description: Zypp Relayer Network - reliability layer for Solana transaction broadcasting
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:3000
+    description: Local
+
+paths:
+  /v1/transactions:
+    post:
+      summary: Submit a signed transaction
+      description: |
+        Accepts a base64-encoded serialized signed Solana transaction, validates it,
+        persists a job, and enqueues it for broadcasting. Returns immediately with a job ID.
+      operationId: submitTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [transaction]
+              properties:
+                transaction:
+                  type: string
+                  description: Base64-encoded serialized signed transaction (max 1232 bytes)
+      responses:
+        "202":
+          description: Accepted - job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId: { type: string, format: uuid }
+                  status: { type: string, enum: [queued] }
+        "400":
+          description: Invalid payload (bad base64, invalid tx, size, or missing signatures)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Duplicate - same transaction already queued or in progress
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  code: { type: string, example: DUPLICATE_TRANSACTION }
+                  jobId: { type: string, format: uuid }
+                  status: { type: string }
+        "429":
+          description: Rate limit exceeded
+
+  /v1/transactions/{jobId}:
+    get:
+      summary: Get job status
+      operationId: getJobStatus
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId: { type: string }
+                  status: { type: string, enum: [queued, sent, confirmed, failed] }
+                  retryCount: { type: integer }
+                  lastError: { type: string, nullable: true }
+                  createdAt: { type: string, format: date-time }
+                  updatedAt: { type: string, format: date-time }
+                  txSignature: { type: string, nullable: true, description: Present when status is sent or confirmed }
+        "404":
+          description: Job not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /health:
+    get:
+      summary: Health check
+      description: Returns 200 when DB and Redis are ok, 503 otherwise
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  checks: { type: object, additionalProperties: { type: string } }
+        "503":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: degraded }
+                  checks: { type: object }
+
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        code: { type: string }
+        message: { type: string }
