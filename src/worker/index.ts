@@ -3,23 +3,22 @@ import { Worker, Job } from "bullmq";
 import Redis from "ioredis";
 import { loadConfig } from "../lib/config.js";
 import { createLogger } from "../lib/logger.js";
-import { createPool } from "../store/pool.js";
+import supabase from "../lib/supabase.js";
 import { getJobById, markJobConfirmed, markJobFailed, incrementJobRetry } from "../store/jobs.js";
-import { broadcastWithFailover } from "./broadcast.js";
+import { broadcastWithFailover, processIntentAndBroadcast } from "./broadcast.js";
 import type { BroadcastJobData } from "../queue/index.js";
 import { isTerminalStatus } from "../lib/constants.js";
 
 async function main() {
   const config = loadConfig();
   const log = createLogger(config.LOG_LEVEL);
-  const pool = createPool(config, log);
 
   const connection = new (Redis as any)(config.REDIS_URL, { maxRetriesPerRequest: null });
   const worker = new Worker<BroadcastJobData>(
-    "zrn:broadcast",
+    "zrn-broadcast",
     async (job: Job<BroadcastJobData>) => {
-      const { jobId } = job.data;
-      const dbJob = await getJobById(pool, jobId);
+      const { jobId, type } = job.data;
+      const dbJob = await getJobById(supabase, jobId);
       if (!dbJob) {
         log.warn({ jobId }, "Job not found in DB, skipping");
         return;
@@ -29,11 +28,16 @@ async function main() {
         return;
       }
 
-      const result = await broadcastWithFailover(dbJob.payload, config, log);
+      let result;
+      if (type === "intent") {
+        result = await processIntentAndBroadcast(dbJob.payload, config, log);
+      } else {
+        result = await broadcastWithFailover(dbJob.payload, config, log);
+      }
 
       if (result.success) {
         const updated = await markJobConfirmed(
-          pool,
+          supabase,
           log,
           jobId,
           result.signature,
@@ -44,12 +48,12 @@ async function main() {
       }
 
       if (result.retriable) {
-        await incrementJobRetry(pool, jobId);
+        await incrementJobRetry(supabase, jobId);
         throw new Error(result.message);
       }
 
       await markJobFailed(
-        pool,
+        supabase,
         log,
         jobId,
         result.message,

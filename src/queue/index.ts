@@ -3,10 +3,11 @@ import type { Config } from "../lib/config.js";
 import type { Logger } from "../lib/logger.js";
 import Redis from "ioredis";
 
-const QUEUE_NAME = "zrn:broadcast";
+const QUEUE_NAME = "zrn-broadcast";
 
 export interface BroadcastJobData {
   jobId: string;
+  type?: "transaction" | "intent";
 }
 
 function createRedis(config: Config) {

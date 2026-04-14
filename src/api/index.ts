@@ -3,18 +3,17 @@ import Fastify from "fastify";
 import rateLimit from "@fastify/rate-limit";
 import { loadConfig } from "../lib/config.js";
 import { createLogger } from "../lib/logger.js";
-import { createPool } from "../store/pool.js";
+import supabase from "../lib/supabase.js";
 import { createQueue, createRedisConnection } from "../queue/index.js";
 import { registerRoutes } from "./routes.js";
 
 async function main() {
   const config = loadConfig();
   const log = createLogger(config.LOG_LEVEL);
-  const pool = createPool(config, log);
   const queue = createQueue(config, log);
   const redis = createRedisConnection(config);
 
-  const app = Fastify({ logger: log });
+  const app = Fastify({ loggerInstance: log as any });
 
   await app.register(rateLimit, {
     max: config.RATE_LIMIT_MAX,
@@ -26,7 +25,7 @@ async function main() {
     },
   });
 
-  await registerRoutes(app, { pool, queue, log });
+  await registerRoutes(app, { supabase, queue, log, intentDomain: config.RELAYER_INTENT_DOMAIN });
 
   app.listen({ port: config.PORT, host: "0.0.0.0" }, (err, address) => {
     if (err) {

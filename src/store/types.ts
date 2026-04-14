@@ -11,6 +11,12 @@ export interface JobRow {
   payload_hash: string;
   payload: Buffer;
   rpc_endpoint_used: string | null;
+  intent_sender: string | null;
+  intent_nonce: string | null;
+  intent_type: string | null;
+  intent_fee: string | null;
+  intent_total: string | null;
+  intent_currency: string | null;
 }
 
 export interface JobInsert {
@@ -18,6 +24,12 @@ export interface JobInsert {
   status: JobStatus;
   payload_hash: string;
   payload: Buffer;
+  intent_sender?: string | null;
+  intent_nonce?: string | null;
+  intent_type?: string | null;
+  intent_fee?: string | null;
+  intent_total?: string | null;
+  intent_currency?: string | null;
 }
 
 export interface JobStatusUpdate {

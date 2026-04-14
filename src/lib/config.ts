@@ -23,6 +23,12 @@ const envSchema = z.object({
   BULL_CONCURRENCY: z.coerce.number().default(5),
   BULL_MAX_ATTEMPTS: z.coerce.number().default(5),
   BULL_BACKOFF_MS: z.coerce.number().default(1000),
+
+  RELAYER_SECRET_KEY: z.string().min(1),
+  USDC_MINT_ADDRESS: z.string().min(1),
+  HOT_WALLET_ADDRESS: z.string().min(1),
+  RELAYER_INTENT_DOMAIN: z.string().min(1),
+  RELAYER_API_KEY: z.string().min(1).optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
