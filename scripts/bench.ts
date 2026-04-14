@@ -43,14 +43,17 @@ async function createSignedTx(connection: Connection, signer: Keypair, nonce: nu
   tx.add(new TransactionInstruction({ keys: [], programId: new PublicKey("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo"), data: Buffer.from(`zrn-bench-${nonce}-${Date.now()}`) }));
   tx.recentBlockhash = blockhash;
   tx.feePayer = signer.publicKey;
-  const stx = await signer.signTransaction(tx);
-  return Buffer.from(stx.serialize());
+  tx.sign(signer);
+  return tx.serialize();
 }
 
 async function submitTx(payloadBase64: string): Promise<{ jobId: string; status: string }> {
   const res = await fetch(`${API_URL}/v1/transactions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-relayer-api-key": process.env.RELAYER_API_KEY || ""
+    },
     body: JSON.stringify({ transaction: payloadBase64 }),
   });
   if (!res.ok) {
@@ -65,7 +68,11 @@ async function pollStatus(jobId: string): Promise<JobResult> {
   const start = Date.now();
   const maxWait = 120_000;
   while (Date.now() - start < maxWait) {
-    const res = await fetch(`${API_URL}/v1/transactions/${jobId}`);
+    const res = await fetch(`${API_URL}/v1/transactions/${jobId}`, {
+      headers: {
+        "x-relayer-api-key": process.env.RELAYER_API_KEY || ""
+      }
+    });
     if (!res.ok) throw new Error(`GET failed ${res.status}`);
     const data = (await res.json()) as {
       jobId: string;
