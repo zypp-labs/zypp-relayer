@@ -1,133 +1,122 @@
 # Zypp Relayer Network (ZRN)
 
-A reliability layer for Solana that enables **asynchronous transaction settlement**. ZRN accepts signed serialized transactions, queues them for processing, broadcasts them to Solana RPC nodes, and ensures confirmation through structured retry logic and status tracking.
+A reliability layer for Solana that enables **asynchronous transaction settlement**.
 
-Built for offline-first applications, mobile-first wallets, and any system that needs resilient transaction broadcasting under unstable connectivity.
+Zypp Relayer Network (ZRN) is the backend infrastructure component built by Zypp Labs. It accepts signed serialized transactions, queues them for processing, broadcasts them to Solana RPC nodes, and ensures confirmation through structured retry logic and status tracking.
 
-**Zypp Labs**
+## What is Zypp Relayer Network?
+
+ZRN allows applications to offload the complexity of transaction broadcasting and confirmation. Instead of failing when connectivity drops or RPCs are unstable, transactions are:
+
+- Queued securely upon receipt
+- Broadcasted with multi-RPC failover
+- Tracked for confirmation or failure with bounded retries
+
+This acts as the critical backbone for offline-first applications like Zypp Pay, making digital payments reliable in real-world conditions, not just ideal ones.
+
+## Core Features
+
+- **Non-custodial:** Only transports and broadcasts fully signed payloads; never holds keys or constructs transactions.
+- **Resilient:** Bounded retries with exponential backoff and multi-RPC failover.
+- **Observable:** Real-time job status tracking (queued → sent → confirmed/failed), retry counts, and audit logs.
+- **Scalable:** Horizontally scalable API and workers using Redis queues and configurable concurrency.
+- **Gasless Experience Support:** Facilitates intent-based and sponsored transactions for end users.
+
+## Where it Works Best
+
+ZRN is designed to power:
+
+- Offline-first applications (like Zypp Pay)
+- Mobile-first wallets
+- High-throughput payment systems
+- Any system requiring resilient transaction broadcasting under unstable connectivity
+
+## Architecture (High-Level)
+
+ZRN operates through:
+
+- **API Server:** A Fastify-based REST API that ingests and validates signed transactions and intents.
+- **Queue System:** A Redis-backed BullMQ system that manages job states and retries.
+- **Worker Nodes:** Dedicated processes that handle the actual broadcasting to Solana RPCs and confirmation polling.
+- **Database:** A Supabase (PostgreSQL) database that stores job statuses, audit logs, and operational metrics.
+
+_Note: The core infrastructure and relayer system are proprietary and not open source._
+
+## Security
+
+- **Stateless Validation:** Validates payloads strictly (max 1232 bytes, valid Solana tx, signatures present).
+- **Replay Protection:** Duplicate payloads and nonces are actively rejected.
+- **Rate Limiting:** Built-in Redis-backed rate limiting per IP to prevent abuse.
+- **API Key Protection:** Endpoints are secured via `x-relayer-api-key`.
+
+## Status
+
+Zypp Relayer Network is currently:
+
+- Fully built and integrated with Zypp Pay
+- Handling workloads on Solana devnet
+- Preparing for mainnet deployment
+
+## Built by Zypp Labs
+
+Zypp Labs is building infrastructure for offline-first financial systems, making digital payments accessible regardless of connectivity.
+
+## Follow the Journey
+
+Stay updated as we push the boundaries of payments:
+
+- **X (Twitter):** [https://x.com/use_zypp](https://x.com/use_zypp)
 
 ---
 
-## Features
+## Developer Guide
 
-- **Non-custodial** — Only transports and broadcasts fully signed payloads; never holds keys or constructs transactions
-- **Resilient** — Bounded retries with exponential backoff; multi-RPC failover
-- **Observable** — Job status (queued → sent → confirmed/failed), retry counts, audit log
-- **Scalable** — Horizontally scalable API and workers; Redis queue; configurable concurrency
+### Quick start
 
----
-
-## Quick start
-
-**Requirements:** Node 20+, PostgreSQL, Redis
+**Requirements:** Node 20+, Supabase (PostgreSQL), Redis
 
 1. **Install and set environment**
 
    ```bash
    npm install
-   cp .env.example .env   # then edit DATABASE_URL, RPC_URLS
+   cp .env.example .env   # then edit DATABASE_URL, RPC_URLS, etc.
    ```
 
-2. **Run Postgres and Redis** (e.g. Docker)
+2. **Run Redis** (e.g. Docker)
 
    ```bash
-   docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
    docker run -d -p 6379:6379 redis:7
+   # Note: PostgreSQL is managed via Supabase. Run the SQL from migrations/ in your Supabase dashboard.
    ```
 
-3. **Migrate and start**
+3. **Start API and Worker**
 
    ```bash
-   npm run migrate
    npm run dev:api      # terminal 1
    npm run dev:worker   # terminal 2
    ```
 
-4. **Submit a transaction**
+### API overview
 
-   ```bash
-   curl -X POST http://localhost:3000/v1/transactions \
-     -H "Content-Type: application/json" \
-     -d '{"transaction":"<base64-serialized-signed-tx>"}'
-   # → 202 { "jobId": "...", "status": "queued" }
+| Method | Path                      | Description                                                          |
+| ------ | ------------------------- | -------------------------------------------------------------------- |
+| POST   | `/v1/intents`             | Submit a base64 serialized signed intent bundle → `202` with `jobId` |
+| POST   | `/v1/transactions`        | Submit a base64 serialized signed transaction → `202`                |
+| GET    | `/v1/transactions/:jobId` | Get job status, signature, retry count, error                        |
+| GET    | `/health`                 | Health check (DB, Redis) → `200` or `503`                            |
+| GET    | `/v1/ops/metrics`         | Returns operational and economic metrics                             |
 
-   curl http://localhost:3000/v1/transactions/<jobId>
-   # → { "jobId", "status", "txSignature?", "retryCount", ... }
-   ```
+Full API spec: `docs/openapi.yaml`
 
----
+### Scripts
 
-## Project structure
-
-```
-zrn/
-├── src/
-│   ├── api/           # HTTP API (Fastify), routes, health
-│   ├── worker/        # BullMQ worker, broadcast + confirm, error classification
-│   ├── queue/         # BullMQ queue and Redis connection
-│   ├── store/         # PostgreSQL jobs, audit log, migrations
-│   └── lib/           # Config (Zod), logger, validation, constants
-├── migrations/        # SQL migrations
-├── scripts/           # Benchmark script
-├── docs/              # OpenAPI spec, runbook
-├── Dockerfile        # API image for Fly.io
-└── fly.toml          # Fly.io app config
-```
-
----
-
-## API overview
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/transactions` | Submit a base64 serialized signed transaction → `202` with `jobId` |
-| GET | `/v1/transactions/:jobId` | Get job status, signature, retry count, error |
-| GET | `/health` | Health check (DB, Redis) → `200` or `503` |
-
-Validation: max 1232 bytes, valid Solana tx, signatures present. Duplicate payloads return `409` with existing `jobId`. Rate limiting per IP (Redis-backed).
-
-Full API spec: [docs/openapi.yaml](docs/openapi.yaml)
-
----
-
-## Scripts
-
-| Command | Description |
-|---------|-------------|
-| `npm run build` | Compile TypeScript to `dist/` |
-| `npm start` | Run API (production) |
-| `npm run worker` | Run broadcaster worker |
-| `npm run dev:api` | Run API with watch |
-| `npm run dev:worker` | Run worker with watch |
-| `npm run migrate` | Run PostgreSQL migrations |
-| `npm run bench` | Benchmark: submit N txs, report success rate and latency (see [docs/RUNBOOK.txt](docs/RUNBOOK.txt)) |
-| `npm run typecheck` | TypeScript check |
-
----
-
-## Configuration
-
-Key environment variables (see [docs/RUNBOOK.txt](docs/RUNBOOK.txt) for the full table):
-
-- **`DATABASE_URL`** — PostgreSQL connection string (required)
-- **`REDIS_URL`** — Redis URL (default `redis://localhost:6379`)
-- **`RPC_URLS`** — Comma-separated Solana RPC URLs (required; e.g. `https://api.devnet.solana.com`)
-- **`RATE_LIMIT_MAX`** / **`RATE_LIMIT_WINDOW_MS`** — Per-IP rate limit
-- **`BULL_CONCURRENCY`** / **`BULL_MAX_ATTEMPTS`** / **`BULL_BACKOFF_MS`** — Worker concurrency and retry
-
----
-
-## Deploy (Fly.io)
-
-```bash
-fly secrets set DATABASE_URL="..." REDIS_URL="..." RPC_URLS="https://api.devnet.solana.com"
-fly deploy
-```
-
-Migrations run automatically via `release_command` in `fly.toml`. See [docs/RUNBOOK.txt](docs/RUNBOOK.txt) for details.
-
----
-
-## License
-
-Private. Zypp Labs.
+| Command              | Description                   |
+| -------------------- | ----------------------------- |
+| `npm run build`      | Compile TypeScript to `dist/` |
+| `npm start`          | Run API (production)          |
+| `npm run worker`     | Run broadcaster worker        |
+| `npm run dev:api`    | Run API with watch            |
+| `npm run dev:worker` | Run worker with watch         |
+| `npm run typecheck`  | TypeScript check              |
+| `npm run lint`       | ESLint check                  |
+| `npm run test`       | Run unit tests                |
