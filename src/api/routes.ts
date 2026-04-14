@@ -4,7 +4,7 @@ import type { Queue } from "bullmq";
 import type { Logger } from "../lib/logger.js";
 import type { BroadcastJobData } from "../queue/index.js";
 import { randomUUID } from "node:crypto";
-import { getJobById, findJobByPayloadHash, findJobByIntentSenderNonce, getOpsMetrics, insertJob } from "../store/jobs.js";
+import { getJobById, findJobByPayloadHash, findJobByIntentSenderNonce, getOpsMetrics, getRecentJobs, insertJob } from "../store/jobs.js";
 import { isTransferIntent, parseIntentPayload, validateTransaction, validateIntent } from "../lib/validate.js";
 
 const ABUSE_SCORE_BLOCK_THRESHOLD = 12;
@@ -351,6 +351,14 @@ export async function registerRoutes(
     return reply.send({
       ...metrics,
       abuseTrackedIps: abuseByIp.size,
+    });
+  });
+
+  app.get("/v1/ops/transactions", async (request: FastifyRequest<{ Querystring: { limit?: string } }>, reply) => {
+    const limit = request.query.limit ? parseInt(request.query.limit, 10) : 20;
+    const jobs = await getRecentJobs(supabase, isNaN(limit) ? 20 : limit);
+    return reply.send({
+      transactions: jobs
     });
   });
 

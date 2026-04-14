@@ -106,6 +106,17 @@ export async function getOpsMetrics(supabase: SupabaseClient) {
   return data;
 }
 
+export async function getRecentJobs(supabase: SupabaseClient, limit = 20) {
+  const { data, error } = await supabase
+    .from("jobs")
+    .select("id, status, payload_hash, intent_sender, intent_nonce, intent_type, intent_fee, intent_total, intent_currency, tx_signature, rpc_endpoint_used, last_error, created_at, updated_at")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return data;
+}
+
 export async function updateJobStatus(
   supabase: SupabaseClient,
   log: Logger,
