@@ -56,6 +56,30 @@ export async function registerRoutes(
   deps: { supabase: SupabaseClient; queue: Queue<BroadcastJobData>; log: Logger; intentDomain: string }
 ): Promise<void> {
   const { supabase, queue, log, intentDomain } = deps;
+
+  app.get("/", async (_request, reply) => {
+    return reply.send({
+      name: "Zypp Relayer",
+      description: "Transaction relay infrastructure for offline-first payments on Solana. Built by Zypp Labs.",
+      version: "v1",
+      status: "operational",
+      docs: "https://relayer.zypp.fun/docs",
+      base_url: "https://relayer.zypp.fun",
+      built_by: "Zypp Labs",
+      website: "https://zypp.fun",
+    });
+  });
+
+  app.get("/docs", async (_request, reply) => {
+    return reply.redirect("https://relayer.zypp.fun/docs", 302);
+  });
+
+  app.get("/robots.txt", async (_request, reply) => {
+    return reply
+      .header("Content-Type", "text/plain")
+      .send("User-agent: *\nAllow: /\nAllow: /docs\nDisallow: /v1/ops/");
+  });
+
   app.addHook("onRequest", async (request, reply) => {
     const ip = getClientIp(request);
     const abuse = getAbuseEntry(ip);
