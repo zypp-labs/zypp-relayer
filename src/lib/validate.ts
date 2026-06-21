@@ -18,21 +18,23 @@ export interface ValidationError {
   message: string;
 }
 
-const baseIntentSchema = z.object({
-  id: z.string().min(1),
-  sender: z.string().min(1),
-  signature: z.string().min(1),
-  timestamp: z.number().int().positive(),
-  metadata: z
-    .object({
-      v: z.literal(1),
-      app: z.literal("zypp-pay"),
-      network: z.enum(["mainnet-beta", "devnet"]),
-      chain: z.literal("solana"),
-      hw: z.string().min(1),
-    })
-    .strict(),
-}).strict();
+const baseIntentSchema = z
+  .object({
+    id: z.string().min(1),
+    sender: z.string().min(1),
+    signature: z.string().min(1),
+    timestamp: z.number().int().positive(),
+    metadata: z
+      .object({
+        v: z.literal(1),
+        app: z.literal("zypp-pay"),
+        network: z.enum(["mainnet-beta", "devnet"]),
+        chain: z.literal("solana"),
+        hw: z.string().min(1),
+      })
+      .strict(),
+  })
+  .strict();
 
 const transferIntentSchema = baseIntentSchema.extend({
   type: z.string().optional(),
@@ -48,11 +50,16 @@ const usdcInitializationIntentSchema = baseIntentSchema.extend({
   nonce: z.string().min(1),
 });
 
-const intentSchema = z.union([transferIntentSchema, usdcInitializationIntentSchema]);
+const intentSchema = z.union([
+  transferIntentSchema,
+  usdcInitializationIntentSchema,
+]);
 const intentBundleSchema = z.object({ intent: intentSchema });
 
 export type TransferIntent = z.infer<typeof transferIntentSchema>;
-export type USDCInitializationIntent = z.infer<typeof usdcInitializationIntentSchema>;
+export type USDCInitializationIntent = z.infer<
+  typeof usdcInitializationIntentSchema
+>;
 export type ZyppIntent = TransferIntent | USDCInitializationIntent;
 export interface ZyppIntentBundle {
   intent: ZyppIntent;
@@ -75,7 +82,9 @@ function computeCanonicalIntentId(intent: TransferIntent): string {
   return createHash("sha256").update(canonicalBody).digest("hex");
 }
 
-function computeCanonicalInitIntentId(intent: USDCInitializationIntent): string {
+function computeCanonicalInitIntentId(
+  intent: USDCInitializationIntent,
+): string {
   const canonicalBody = JSON.stringify({
     type: intent.type,
     sender: intent.sender,
@@ -85,7 +94,10 @@ function computeCanonicalInitIntentId(intent: USDCInitializationIntent): string 
   return createHash("sha256").update(canonicalBody).digest("hex");
 }
 
-function domainSeparatedIntentHash(intentDomain: string, intentId: string): Buffer {
+function domainSeparatedIntentHash(
+  intentDomain: string,
+  intentId: string,
+): Buffer {
   const digest = createHash("sha256")
     .update(`${intentDomain}:${intentId}`)
     .digest();
@@ -114,58 +126,108 @@ function hasMaxUsdcPrecision(value: number): boolean {
 
 function validateIntentInvariants(intent: ZyppIntent): ValidationError | null {
   if (!/^[a-f0-9]{64}$/i.test(intent.id)) {
-    return { ok: false, code: "INVALID_INTENT_ID_FORMAT", message: "Intent ID must be a 64-char hex SHA-256 hash" };
+    return {
+      ok: false,
+      code: "INVALID_INTENT_ID_FORMAT",
+      message: "Intent ID must be a 64-char hex SHA-256 hash",
+    };
   }
 
   if (!isValidPublicKey(intent.sender)) {
-    return { ok: false, code: "INVALID_SENDER", message: "Intent sender must be a valid Solana public key" };
+    return {
+      ok: false,
+      code: "INVALID_SENDER",
+      message: "Intent sender must be a valid Solana public key",
+    };
   }
 
   const sigBytes = Buffer.from(intent.signature, "base64");
   if (sigBytes.length !== 64) {
-    return { ok: false, code: "INVALID_SIGNATURE_FORMAT", message: "Intent signature must be a valid Ed25519 signature" };
+    return {
+      ok: false,
+      code: "INVALID_SIGNATURE_FORMAT",
+      message: "Intent signature must be a valid Ed25519 signature",
+    };
   }
 
   if (!isRecentTimestamp(intent.timestamp)) {
-    return { ok: false, code: "INVALID_TIMESTAMP", message: "Intent timestamp is out of allowed range" };
+    return {
+      ok: false,
+      code: "INVALID_TIMESTAMP",
+      message: "Intent timestamp is out of allowed range",
+    };
   }
 
   if (isTransferIntent(intent)) {
     if (!isValidPublicKey(intent.receiver)) {
-      return { ok: false, code: "INVALID_RECEIVER", message: "Intent receiver must be a valid Solana public key" };
+      return {
+        ok: false,
+        code: "INVALID_RECEIVER",
+        message: "Intent receiver must be a valid Solana public key",
+      };
     }
-    if (!hasMaxUsdcPrecision(intent.amount) || !hasMaxUsdcPrecision(intent.fee) || !hasMaxUsdcPrecision(intent.total)) {
-      return { ok: false, code: "INVALID_PRECISION", message: "USDC values must have at most 6 decimal places" };
+    if (
+      !hasMaxUsdcPrecision(intent.amount) ||
+      !hasMaxUsdcPrecision(intent.fee) ||
+      !hasMaxUsdcPrecision(intent.total)
+    ) {
+      return {
+        ok: false,
+        code: "INVALID_PRECISION",
+        message: "USDC values must have at most 6 decimal places",
+      };
     }
     const expectedTotal = intent.amount + intent.fee;
     if (Math.abs(expectedTotal - intent.total) > 1e-9) {
-      return { ok: false, code: "INVALID_TOTAL", message: "Intent total must equal amount + fee" };
+      return {
+        ok: false,
+        code: "INVALID_TOTAL",
+        message: "Intent total must equal amount + fee",
+      };
     }
     const canonicalId = computeCanonicalIntentId(intent);
     if (canonicalId !== intent.id) {
-      return { ok: false, code: "INVALID_INTENT_ID", message: "Intent ID does not match canonical payload hash" };
+      return {
+        ok: false,
+        code: "INVALID_INTENT_ID",
+        message: "Intent ID does not match canonical payload hash",
+      };
     }
   } else {
     const canonicalId = computeCanonicalInitIntentId(intent);
     if (canonicalId !== intent.id) {
-      return { ok: false, code: "INVALID_INTENT_ID", message: "Intent ID does not match canonical payload hash" };
+      return {
+        ok: false,
+        code: "INVALID_INTENT_ID",
+        message: "Intent ID does not match canonical payload hash",
+      };
     }
   }
 
   return null;
 }
 
-export function parseIntentPayload(payload: Buffer): ValidationError | { ok: true; bundle: ZyppIntentBundle } {
+export function parseIntentPayload(
+  payload: Buffer,
+): ValidationError | { ok: true; bundle: ZyppIntentBundle } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(payload.toString("utf-8"));
   } catch {
-    return { ok: false, code: "INVALID_JSON", message: "Intent bundle must be valid JSON" };
+    return {
+      ok: false,
+      code: "INVALID_JSON",
+      message: "Intent bundle must be valid JSON",
+    };
   }
 
   const bundleResult = intentBundleSchema.safeParse(parsed);
   if (!bundleResult.success) {
-    return { ok: false, code: "INVALID_INTENT", message: "Intent bundle is missing required fields" };
+    return {
+      ok: false,
+      code: "INVALID_INTENT",
+      message: "Intent bundle is missing required fields",
+    };
   }
 
   const invariantError = validateIntentInvariants(bundleResult.data.intent);
@@ -179,14 +241,18 @@ export function parseIntentPayload(payload: Buffer): ValidationError | { ok: tru
 export async function validateIntent(
   base64: string,
   log: Logger,
-  intentDomain: string
+  intentDomain: string,
 ): Promise<ValidationResult | ValidationError> {
   let payload: Buffer;
   try {
     payload = Buffer.from(base64, "base64");
   } catch {
     log.debug("Invalid base64 in intent payload");
-    return { ok: false, code: "INVALID_BASE64", message: "Invalid base64 encoding" };
+    return {
+      ok: false,
+      code: "INVALID_BASE64",
+      message: "Invalid base64 encoding",
+    };
   }
 
   const parsed = parseIntentPayload(payload);
@@ -203,30 +269,46 @@ export async function validateIntent(
 
     const isValid = nacl.sign.detached.verify(message, signature, publicKey);
     if (!isValid) {
-      return { ok: false, code: "INVALID_SIGNATURE", message: "User intent signature is invalid" };
+      return {
+        ok: false,
+        code: "INVALID_SIGNATURE",
+        message: "User intent signature is invalid",
+      };
     }
 
     // Intent ID acts as the unique hash for deduplication
     const payloadHash = intent.id;
     return { ok: true, payload, payloadHash };
   } catch {
-    return { ok: false, code: "INVALID_INTENT", message: "Intent contains invalid key or signature encoding" };
+    return {
+      ok: false,
+      code: "INVALID_INTENT",
+      message: "Intent contains invalid key or signature encoding",
+    };
   }
 }
 
 export function validateTransaction(
   base64: string,
-  log: Logger
+  log: Logger,
 ): ValidationResult | ValidationError {
   let payload: Buffer;
   try {
     payload = Buffer.from(base64, "base64");
   } catch {
     log.debug("Invalid base64 in transaction payload");
-    return { ok: false, code: "INVALID_BASE64", message: "Invalid base64 encoding" };
+    return {
+      ok: false,
+      code: "INVALID_BASE64",
+      message: "Invalid base64 encoding",
+    };
   }
   if (payload.length === 0) {
-    return { ok: false, code: "EMPTY_PAYLOAD", message: "Transaction payload is empty" };
+    return {
+      ok: false,
+      code: "EMPTY_PAYLOAD",
+      message: "Transaction payload is empty",
+    };
   }
   if (payload.length > MAX_TX_SIZE) {
     return {
@@ -238,7 +320,11 @@ export function validateTransaction(
   try {
     const tx = VersionedTransaction.deserialize(payload);
     if (!tx.signatures || tx.signatures.length === 0) {
-      return { ok: false, code: "NO_SIGNATURES", message: "Transaction has no signatures" };
+      return {
+        ok: false,
+        code: "NO_SIGNATURES",
+        message: "Transaction has no signatures",
+      };
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

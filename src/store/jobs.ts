@@ -8,15 +8,55 @@ function toBytea(buf: Buffer): string {
   return "\\x" + buf.toString("hex");
 }
 
-function fromBytea(str: string): Buffer {
-  if (str.startsWith("\\x")) return Buffer.from(str.slice(2), "hex");
-  return Buffer.from(str, "hex");
+function fromBytea(data: string | Buffer | Uint8Array | any): Buffer {
+  // If already a Buffer, return as-is
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+
+  // If Uint8Array, convert to Buffer
+  if (data instanceof Uint8Array) {
+    return Buffer.from(data);
+  }
+
+  // If string, handle hex format with optional \x prefix
+  if (typeof data === "string") {
+    if (data.startsWith("\\x")) {
+      return Buffer.from(data.slice(2), "hex");
+    }
+    return Buffer.from(data, "hex");
+  }
+
+  // If it's an object with data/type array (ArrayBuffer-like), convert it
+  if (typeof data === "object" && data !== null) {
+    // Handle plain objects that have array-like properties
+    if (data.type === "Buffer" && Array.isArray(data.data)) {
+      return Buffer.from(data.data);
+    }
+    // Try generic conversion
+    try {
+      return Buffer.from(data);
+    } catch (e) {
+      throw new Error(`Cannot convert payload of type ${typeof data}: ${e}`);
+    }
+  }
+
+  throw new Error(`Cannot convert payload of type ${typeof data} to Buffer`);
+}
+
+function mapJobRow(data: Record<string, unknown>): JobRow {
+  return {
+    ...(data as Omit<JobRow, "created_at" | "updated_at" | "payload">),
+    created_at: new Date(data.created_at as string | Date),
+    updated_at: new Date(data.updated_at as string | Date),
+    payload: fromBytea(data.payload),
+  };
 }
 
 export async function insertJob(
   supabase: SupabaseClient,
   log: Logger,
-  job: JobInsert
+  job: JobInsert,
 ): Promise<JobRow> {
   const { data, error } = await supabase
     .from("jobs")
@@ -38,14 +78,13 @@ export async function insertJob(
     .single();
 
   if (error || !data) throw new Error("Insert job failed: " + error?.message);
-  data.payload = fromBytea(data.payload);
   log.debug({ jobId: data.id, payloadHash: job.payload_hash }, "Job inserted");
-  return data as JobRow;
+  return mapJobRow(data);
 }
 
 export async function getJobById(
   supabase: SupabaseClient,
-  jobId: string
+  jobId: string,
 ): Promise<JobRow | null> {
   const { data, error } = await supabase
     .from("jobs")
@@ -55,14 +94,14 @@ export async function getJobById(
 
   if (error) throw error;
   if (!data) return null;
-  data.payload = fromBytea(data.payload);
-  return data as JobRow;
+
+  return mapJobRow(data);
 }
 
 /** Find an existing non-failed job with the same payload hash (for duplicate detection). */
 export async function findJobByPayloadHash(
   supabase: SupabaseClient,
-  payloadHash: string
+  payloadHash: string,
 ): Promise<JobRow | null> {
   const { data, error } = await supabase
     .from("jobs")
@@ -75,15 +114,14 @@ export async function findJobByPayloadHash(
 
   if (error) throw error;
   if (!data) return null;
-  data.payload = fromBytea(data.payload);
-  return data as JobRow;
+  return mapJobRow(data);
 }
 
 /** Find any existing job for a sender+nonce pair to prevent replay. */
 export async function findJobByIntentSenderNonce(
   supabase: SupabaseClient,
   sender: string,
-  nonce: string
+  nonce: string,
 ): Promise<JobRow | null> {
   const { data, error } = await supabase
     .from("jobs")
@@ -96,8 +134,7 @@ export async function findJobByIntentSenderNonce(
 
   if (error) throw error;
   if (!data) return null;
-  data.payload = fromBytea(data.payload);
-  return data as JobRow;
+  return mapJobRow(data);
 }
 
 export async function getOpsMetrics(supabase: SupabaseClient) {
@@ -109,7 +146,9 @@ export async function getOpsMetrics(supabase: SupabaseClient) {
 export async function getRecentJobs(supabase: SupabaseClient, limit = 20) {
   const { data, error } = await supabase
     .from("jobs")
-    .select("id, status, payload_hash, intent_sender, intent_nonce, intent_type, intent_fee, intent_total, intent_currency, tx_signature, rpc_endpoint_used, last_error, created_at, updated_at")
+    .select(
+      "id, status, payload_hash, intent_sender, intent_nonce, intent_type, intent_fee, intent_total, intent_currency, tx_signature, rpc_endpoint_used, last_error, created_at, updated_at",
+    )
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -122,20 +161,19 @@ export async function updateJobStatus(
   log: Logger,
   jobId: string,
   update: JobStatusUpdate,
-  options: { incrementRetry?: boolean } = {}
+  options: { incrementRetry?: boolean } = {},
 ): Promise<void> {
   const payload: any = {
     status: update.status,
     updated_at: new Date().toISOString(),
   };
   if (update.last_error !== undefined) payload.last_error = update.last_error;
-  if (update.tx_signature !== undefined) payload.tx_signature = update.tx_signature;
-  if (update.rpc_endpoint_used !== undefined) payload.rpc_endpoint_used = update.rpc_endpoint_used;
+  if (update.tx_signature !== undefined)
+    payload.tx_signature = update.tx_signature;
+  if (update.rpc_endpoint_used !== undefined)
+    payload.rpc_endpoint_used = update.rpc_endpoint_used;
 
-  const { error } = await supabase
-    .from("jobs")
-    .update(payload)
-    .eq("id", jobId);
+  const { error } = await supabase.from("jobs").update(payload).eq("id", jobId);
 
   if (error) throw error;
 
@@ -145,7 +183,7 @@ export async function updateJobStatus(
 
   log.debug(
     { jobId, status: update.status, lastError: update.last_error },
-    "Job status updated"
+    "Job status updated",
   );
 }
 
@@ -153,7 +191,7 @@ export async function appendAuditLog(
   supabase: SupabaseClient,
   jobId: string,
   fromStatus: JobStatus | null,
-  toStatus: JobStatus
+  toStatus: JobStatus,
 ): Promise<void> {
   const { error } = await supabase
     .from("audit_log")
@@ -167,11 +205,15 @@ export async function markJobSent(
   supabase: SupabaseClient,
   log: Logger,
   jobId: string,
-  rpcEndpoint: string
+  rpcEndpoint: string,
 ): Promise<boolean> {
   const { data, error } = await supabase
     .from("jobs")
-    .update({ status: "sent", rpc_endpoint_used: rpcEndpoint, updated_at: new Date().toISOString() })
+    .update({
+      status: "sent",
+      rpc_endpoint_used: rpcEndpoint,
+      updated_at: new Date().toISOString(),
+    })
     .eq("id", jobId)
     .eq("status", "queued")
     .select("id");
@@ -191,11 +233,16 @@ export async function markJobConfirmed(
   log: Logger,
   jobId: string,
   txSignature: string,
-  rpcEndpoint: string
+  rpcEndpoint: string,
 ): Promise<boolean> {
   const { data, error } = await supabase
     .from("jobs")
-    .update({ status: "confirmed", tx_signature: txSignature, rpc_endpoint_used: rpcEndpoint, updated_at: new Date().toISOString() })
+    .update({
+      status: "confirmed",
+      tx_signature: txSignature,
+      rpc_endpoint_used: rpcEndpoint,
+      updated_at: new Date().toISOString(),
+    })
     .eq("id", jobId)
     .in("status", ["queued", "sent"])
     .select("status");
@@ -203,7 +250,12 @@ export async function markJobConfirmed(
   if (error) throw error;
   const updated = data && data.length > 0;
   if (updated) {
-    await appendAuditLog(supabase, jobId, data[0].status as JobStatus, "confirmed");
+    await appendAuditLog(
+      supabase,
+      jobId,
+      data[0].status as JobStatus,
+      "confirmed",
+    );
     log.info({ jobId, txSignature, rpcEndpoint }, "Job confirmed");
   }
   return updated;
@@ -215,9 +267,13 @@ export async function markJobFailed(
   log: Logger,
   jobId: string,
   lastError: string,
-  rpcEndpoint: string | null
+  rpcEndpoint: string | null,
 ): Promise<boolean> {
-  const payload: any = { status: "failed", last_error: lastError, updated_at: new Date().toISOString() };
+  const payload: any = {
+    status: "failed",
+    last_error: lastError,
+    updated_at: new Date().toISOString(),
+  };
   if (rpcEndpoint) payload.rpc_endpoint_used = rpcEndpoint;
 
   const { data, error } = await supabase
@@ -230,7 +286,12 @@ export async function markJobFailed(
   if (error) throw error;
   const updated = data && data.length > 0;
   if (updated) {
-    await appendAuditLog(supabase, jobId, data[0].status as JobStatus, "failed");
+    await appendAuditLog(
+      supabase,
+      jobId,
+      data[0].status as JobStatus,
+      "failed",
+    );
     log.warn({ jobId, lastError, rpcEndpoint }, "Job failed");
   }
   return updated;
@@ -239,8 +300,10 @@ export async function markJobFailed(
 /** Increment retry count (e.g. when we will retry after transient error). */
 export async function incrementJobRetry(
   supabase: SupabaseClient,
-  jobId: string
+  jobId: string,
 ): Promise<void> {
-  const { error } = await supabase.rpc("increment_job_retry", { p_job_id: jobId });
+  const { error } = await supabase.rpc("increment_job_retry", {
+    p_job_id: jobId,
+  });
   if (error) throw error;
 }

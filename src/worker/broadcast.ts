@@ -10,12 +10,14 @@ import {
   createTransferCheckedInstruction,
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
+  getAccount,
 } from "@solana/spl-token";
 import type { Config } from "../lib/config.js";
 import type { Logger } from "../lib/logger.js";
 import { classifyError } from "./classify.js";
 import { Buffer } from "buffer";
 import { isTransferIntent, parseIntentPayload } from "../lib/validate.js";
+import bs58 from "bs58";
 
 export interface BroadcastResult {
   success: true;
@@ -33,7 +35,7 @@ export interface BroadcastFailure {
 export async function processIntentAndBroadcast(
   payload: Buffer,
   config: Config,
-  log: Logger
+  log: Logger,
 ): Promise<BroadcastResult | BroadcastFailure> {
   try {
     const parsed = parseIntentPayload(payload);
@@ -51,10 +53,17 @@ export async function processIntentAndBroadcast(
     const connection = new Connection(endpoints[0], commitment);
 
     // 1. Setup Sponsor (Relayer)
-    const sponsorKey = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(config.RELAYER_SECRET_KEY)));
+    const sponsorKey = Keypair.fromSecretKey(
+      new Uint8Array(bs58.decode(config.RELAYER_SECRET_KEY)),
+    );
     const usdcMint = new PublicKey(config.USDC_MINT_ADDRESS);
     const hotWallet = new PublicKey(config.HOT_WALLET_ADDRESS);
     const sender = new PublicKey(intent.sender);
+
+    log.debug(
+      { hotWallet: hotWallet.toString(), sender: sender.toString() },
+      "Processing transfer",
+    );
 
     const { blockhash } = await connection.getLatestBlockhash();
 
@@ -66,47 +75,80 @@ export async function processIntentAndBroadcast(
 
     // 2. Handle different intent types
     if (!isTransferIntent(intent)) {
-      log.info({ userId: intent.sender }, "Processing gasless USDC initialization");
-      const associatedTokenAddress = await getAssociatedTokenAddress(usdcMint, sender);
+      log.info(
+        { userId: intent.sender },
+        "Processing gasless USDC initialization",
+      );
+      const associatedTokenAddress = await getAssociatedTokenAddress(
+        usdcMint,
+        sender,
+      );
 
       tx.add(
         createAssociatedTokenAccountInstruction(
           sponsorKey.publicKey, // Payer (Relayer)
           associatedTokenAddress,
           sender,
-          usdcMint
-        )
+          usdcMint,
+        ),
       );
     } else {
       // Default: USDC Transfer
       const receiver = new PublicKey(intent.receiver);
       const senderAta = await getAssociatedTokenAddress(usdcMint, sender);
       const receiverAta = await getAssociatedTokenAddress(usdcMint, receiver);
-      const hotWalletAta = await getAssociatedTokenAddress(usdcMint, hotWallet);
+      const sponsorAta = await getAssociatedTokenAddress(
+        usdcMint,
+        sponsorKey.publicKey,
+      );
 
-      // Use hotWallet (relayer) as the delegate authority
+      // Ensure destination token accounts exist before transfer
+      for (const [owner, ata] of [
+        [receiver, receiverAta],
+        [sponsorKey.publicKey, sponsorAta],
+      ] as const) {
+        try {
+          await getAccount(connection, ata);
+        } catch {
+          tx.add(
+            createAssociatedTokenAccountInstruction(
+              sponsorKey.publicKey,
+              ata,
+              owner,
+              usdcMint,
+            ),
+          );
+        }
+      }
+
+      const amountMicro = BigInt(Math.round(intent.amount * 1_000_000));
+      const feeMicro = BigInt(Math.round(intent.fee * 1_000_000));
+
+      // Transfer to receiver (relayer is the delegate authority)
       tx.add(
         createTransferCheckedInstruction(
           senderAta,
           usdcMint,
           receiverAta,
-          hotWallet, // Using relayer's hot wallet as delegate authority
-          BigInt(Math.floor(intent.amount * 1_000_000)), // USDC 6 decimals
-          6
-        )
+          sponsorKey.publicKey, // Relayer is the delegate (hot wallet)
+          amountMicro,
+          6,
+        ),
       );
 
-      // Add Fee Transfer ($0.01)
-      tx.add(
-        createTransferCheckedInstruction(
-          senderAta,
-          usdcMint,
-          hotWalletAta,
-          hotWallet, // Using relayer's hot wallet as delegate authority
-          BigInt(Math.floor(intent.fee * 1_000_000)),
-          6
-        )
-      );
+      // Add Fee Transfer to relayer
+      if (feeMicro > 0n) {
+        tx.add(
+          createTransferCheckedInstruction(
+            senderAta,
+            usdcMint,
+            sponsorAta,
+            sponsorKey.publicKey, // Relayer is the delegate (hot wallet)
+            feeMicro,
+            6,
+          ),
+        );
+      }
     }
 
     // 3. Combine Signatures
@@ -126,7 +168,7 @@ export async function processIntentAndBroadcast(
 export async function broadcastWithFailover(
   payload: Buffer,
   config: Config,
-  log: Logger
+  log: Logger,
 ): Promise<BroadcastResult | BroadcastFailure> {
   const endpoints = config.RPC_URLS;
   const commitment = config.RPC_CONFIRMATION_COMMITMENT as Commitment;
@@ -142,7 +184,7 @@ export async function broadcastWithFailover(
         payload,
         commitment,
         timeout,
-        log
+        log,
       );
       if (result.success) return result;
       if (!result.retriable) return result;
@@ -177,7 +219,7 @@ async function tryBroadcastOne(
   payload: Buffer,
   commitment: Commitment,
   timeoutMs: number,
-  log: Logger
+  log: Logger,
 ): Promise<BroadcastResult | BroadcastFailure> {
   const connection = new Connection(endpoint, { commitment });
 
@@ -204,7 +246,7 @@ async function tryBroadcastOne(
     signature,
     commitment,
     timeoutMs,
-    log
+    log,
   );
 
   if (confirmed === true) {
@@ -234,7 +276,7 @@ async function waitForConfirmation(
   signature: string,
   _commitment: Commitment,
   timeoutMs: number,
-  _log: Logger
+  _log: Logger,
 ): Promise<true | "expired" | Error> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
