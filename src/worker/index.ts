@@ -7,6 +7,7 @@ import supabase from "../lib/supabase.js";
 import { getJobById, markJobConfirmed, markJobFailed, incrementJobRetry } from "../store/jobs.js";
 import { broadcastWithFailover, processIntentAndBroadcast } from "./broadcast.js";
 import type { BroadcastJobData } from "../queue/index.js";
+import type { IntentEnvelope } from "../lib/feePayer.js";
 import { isTerminalStatus } from "../lib/constants.js";
 
 async function main() {
@@ -27,10 +28,30 @@ async function main() {
         log.debug({ jobId, status: dbJob.status }, "Job already terminal, skipping");
         return;
       }
+      if (dbJob.degraded) {
+        log.debug({ jobId }, "Job flagged as degraded, skipping queue processing");
+        return;
+      }
 
       let result;
       if (type === "intent") {
-        result = await processIntentAndBroadcast(dbJob.payload, config, log);
+        let intentEnvelope: IntentEnvelope | undefined;
+        if (dbJob.intent_envelope) {
+          try {
+            intentEnvelope = JSON.parse(dbJob.intent_envelope) as IntentEnvelope;
+          } catch {
+            log.warn({ jobId }, "Failed to parse intent_envelope from DB");
+          }
+        }
+        if (!intentEnvelope) {
+          await markJobFailed(
+            supabase, log, jobId,
+            "MISSING_INTENT_ENVELOPE: Job has type 'intent' but no valid intent_envelope in DB",
+            null, "Validation", "MISSING_INTENT_ENVELOPE",
+          );
+          return;
+        }
+        result = await processIntentAndBroadcast(dbJob.payload, intentEnvelope, config, log);
       } else {
         result = await broadcastWithFailover(dbJob.payload, config, log);
       }
@@ -43,7 +64,10 @@ async function main() {
           result.signature,
           result.rpcEndpoint
         );
-        if (!updated) log.warn({ jobId }, "Could not mark job confirmed (already updated?)");
+        if (!updated) {
+          log.warn({ jobId }, "Could not mark job confirmed (already updated?)");
+          return;
+        }
         return;
       }
 
@@ -57,7 +81,9 @@ async function main() {
         log,
         jobId,
         result.message,
-        result.rpcEndpoint ?? null
+        result.rpcEndpoint ?? null,
+        result.failure?.stage ?? null,
+        result.failure?.code ?? null,
       );
     },
     {

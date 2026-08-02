@@ -2,10 +2,16 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Queue } from "bullmq";
 import type { Logger } from "../lib/logger.js";
+import type { Config } from "../lib/config.js";
 import type { BroadcastJobData } from "../queue/index.js";
 import { randomUUID } from "node:crypto";
-import { getJobById, findJobByPayloadHash, findJobByIntentSenderNonce, getOpsMetrics, getRecentJobs, insertJob } from "../store/jobs.js";
-import { isTransferIntent, parseIntentPayload, validateTransaction, validateIntent } from "../lib/validate.js";
+import { getJobByIdForTeam, findJobByPayloadHash, findJobByIntentSenderNonce, getOpsMetricsForTeam, getRecentJobsForTeam, insertJob, updateJobStatus } from "../store/jobs.js";
+import { isTransferIntent, parseIntentPayload, validateIntent } from "../lib/validate.js";
+import { validateV1Envelope } from "../lib/validateV1.js";
+import { INTENT_TYPES_REQUIRING_TRANSACTION } from "../lib/constants.js";
+import { RelayerFailureStage } from "../lib/failureCodes.js";
+import { findTeamByApiKey, touchApiKey } from "../store/apiKeys.js";
+import { processShunt } from "../lib/shunt.js";
 
 const ABUSE_SCORE_BLOCK_THRESHOLD = 12;
 const ABUSE_SCORE_DECAY_WINDOW_MS = 5 * 60_000;
@@ -51,11 +57,25 @@ function clearAbuse(ip: string) {
   }
 }
 
+type RouteDeps = {
+  supabase: SupabaseClient;
+  queue: Queue<BroadcastJobData>;
+  log: Logger;
+  intentDomain: string;
+  config: Config;
+};
+
+declare module "fastify" {
+  interface FastifyRequest {
+    teamId?: string;
+  }
+}
+
 export async function registerRoutes(
   app: FastifyInstance,
-  deps: { supabase: SupabaseClient; queue: Queue<BroadcastJobData>; log: Logger; intentDomain: string }
+  deps: RouteDeps,
 ): Promise<void> {
-  const { supabase, queue, log, intentDomain } = deps;
+  const { supabase, queue, log, intentDomain, config } = deps;
 
   app.get("/", async (_request, reply) => {
     return reply.send({
@@ -91,22 +111,36 @@ export async function registerRoutes(
       });
     }
 
-    const expectedApiKey = process.env.RELAYER_API_KEY;
-    if (!expectedApiKey) return;
-    const provided = request.headers["x-relayer-api-key"];
-    if (provided !== expectedApiKey) {
+    const provided = request.headers["x-api-key"] as string | undefined;
+    if (!provided) {
+      markAbuse(ip, 2);
+      return reply.status(401).send({
+        error: "Unauthorized",
+        code: "MISSING_API_KEY",
+        message: "x-api-key header required",
+      });
+    }
+
+    const team = await findTeamByApiKey(supabase, provided);
+    if (!team) {
       markAbuse(ip, 2);
       return reply.status(401).send({
         error: "Unauthorized",
         code: "INVALID_API_KEY",
-        message: "Missing or invalid relayer API key",
+        message: "Invalid or revoked API key",
       });
     }
+
+    request.teamId = team.teamId;
+    void touchApiKey(supabase, provided).catch((err) =>
+      log.warn({ err }, "Failed to update api_key last_used_at")
+    );
   });
 
-  const submitIntent = async (
+  const submitLegacyIntent = async (
     payloadBase64: string,
-    ip: string
+    ip: string,
+    teamId: string
   ): Promise<
     | { ok: true; response: { jobId: string; status: "queued" } }
     | { ok: false; statusCode: number; response: Record<string, unknown> }
@@ -120,6 +154,7 @@ export async function registerRoutes(
           error: "Bad Request",
           code: "INVALID_BODY",
           message: "Body must include 'payload' (base64 string of intent bundle)",
+          failureStage: RelayerFailureStage.Validation,
         },
       };
     }
@@ -134,6 +169,7 @@ export async function registerRoutes(
           error: "Bad Request",
           code: validation.code,
           message: validation.message,
+          failureStage: RelayerFailureStage.Validation,
         },
       };
     }
@@ -149,13 +185,22 @@ export async function registerRoutes(
           error: "Bad Request",
           code: parsed.code,
           message: parsed.message,
+          failureStage: RelayerFailureStage.Validation,
         },
       };
     }
     const { intent } = parsed.bundle;
 
+    // Same cross-tenant reasoning as the v1 path: dedup and replay lookups are
+    // intentionally global, so a conflict may belong to another team. Echo the
+    // conflicting job's identifiers only when the caller owns it.
     const existing = await findJobByPayloadHash(supabase, payloadHash);
     if (existing) {
+      const ownJob = existing.team_id === teamId;
+      log.info(
+        { conflictJobId: existing.id, ownJob, teamId },
+        "Legacy intent rejected: duplicate payload hash",
+      );
       return {
         ok: false,
         statusCode: 409,
@@ -163,15 +208,20 @@ export async function registerRoutes(
           error: "Conflict",
           code: "DUPLICATE_INTENT",
           message: "An intent with the same ID is already queued or in progress",
-          jobId: existing.id,
-          status: existing.status,
+          ...(ownJob ? { jobId: existing.id, status: existing.status } : {}),
+          failureStage: RelayerFailureStage.Validation,
         },
       };
     }
 
     const nonceReplay = await findJobByIntentSenderNonce(supabase, intent.sender, intent.nonce);
     if (nonceReplay) {
+      const ownJob = nonceReplay.team_id === teamId;
       markAbuse(ip);
+      log.info(
+        { conflictJobId: nonceReplay.id, ownJob, teamId },
+        "Legacy intent rejected: sender+nonce replay",
+      );
       return {
         ok: false,
         statusCode: 409,
@@ -179,8 +229,8 @@ export async function registerRoutes(
           error: "Conflict",
           code: "DUPLICATE_INTENT",
           message: "An intent with the same sender and nonce already exists",
-          jobId: nonceReplay.id,
-          status: nonceReplay.status,
+          ...(ownJob ? { jobId: nonceReplay.id, status: nonceReplay.status } : {}),
+          failureStage: RelayerFailureStage.Validation,
         },
       };
     }
@@ -197,6 +247,7 @@ export async function registerRoutes(
       intent_fee: isTransferIntent(intent) ? String(intent.fee) : null,
       intent_total: isTransferIntent(intent) ? String(intent.total) : null,
       intent_currency: "USDC",
+      team_id: teamId,
     });
     await queue.add("broadcast", { jobId, type: "intent" } as BroadcastJobData, { jobId });
     clearAbuse(ip);
@@ -208,20 +259,280 @@ export async function registerRoutes(
     };
   };
 
-  app.post<{ Body: { payload: string } }>(
-    "/v1/intents",
-    async (request: FastifyRequest<{ Body: { payload: string } }>, reply: FastifyReply) => {
-      const result = await submitIntent(request.body?.payload, getClientIp(request));
-      if (!result.ok) {
-        return reply.status(result.statusCode).send(result.response);
+  const submitV1Envelope = async (
+    body: Record<string, unknown>,
+    ip: string,
+    teamId: string,
+  ): Promise<
+    | { ok: true; response: { jobId: string; status: "queued" | "shunted" } }
+    | { ok: false; statusCode: number; response: Record<string, unknown> }
+  > => {
+    const validation = validateV1Envelope(body, log);
+    if (!validation.ok) {
+      markAbuse(ip);
+      return {
+        ok: false,
+        statusCode: 400,
+        response: {
+          error: "Bad Request",
+          code: validation.code,
+          message: validation.message,
+          failureStage: RelayerFailureStage.Validation,
+        },
+      };
+    }
+
+    const { envelope, txBytes, payloadHash } = validation;
+
+    // The relayer settles payment intents only. Ticket and action intents are
+    // developer-domain events: the SDK's own routing model sends them to
+    // ExitTarget::DeveloperBackend, and Zypp is not their system of record.
+    //
+    // An earlier "acknowledge and close" branch persisted them here with status
+    // 'acknowledged'. That was removed — it wrote a row nothing read, notified
+    // nobody (webhook delivery is unimplemented), and accepted an unverified
+    // intent_sender, since non-payment intents require no signature and never
+    // reach the worker's Ed25519 gate. That let any valid API key write rows
+    // attributed to an arbitrary public key, and squat the global
+    // (sender, nonce) namespace against a victim's future payment intents.
+    //
+    // 501 rather than 400: this is "not routed through the relayer yet", not
+    // "your request is malformed". The 'acknowledged' enum value is retained in
+    // the schema (Postgres cannot drop an enum value) and is now unwritten.
+    if (!INTENT_TYPES_REQUIRING_TRANSACTION.has(envelope.intent)) {
+      // Deliberately no markAbuse() here. Reaching this branch means following
+      // the SDK's documented surface — exportIntentToJSON/submitIntentToRelayer
+      // accept any intent kind — so it is an integration mismatch, not abuse.
+      // Penalising it would IP-block an honest developer after ~6 requests.
+      return {
+        ok: false,
+        statusCode: 501,
+        response: {
+          error: "Not Implemented",
+          code: "INTENT_TYPE_NOT_YET_SUPPORTED",
+          message:
+            `The relayer settles payment intents only; '${envelope.intent}' is not routed ` +
+            "through it yet. Ticket and action intents are delivered to your own backend " +
+            "endpoint — see the SDK's ExitTarget::DeveloperBackend.",
+          intent: envelope.intent,
+        },
+      };
+    }
+
+    // Dedup and replay checks are deliberately global, NOT team-scoped: the same
+    // wallet may submit through several teams' API keys, and a payload hash or
+    // (sender, nonce) pair must be single-use across all of them or replay
+    // protection is defeated.
+    //
+    // The consequence is that a conflict may be against another team's job, so
+    // the response must not echo that job's id or status — doing so leaked
+    // cross-tenant identifiers to any caller who could provoke a collision.
+    // Only whether a conflict occurred is disclosed. The jobId is logged
+    // server-side for support.
+    const existing = await findJobByPayloadHash(supabase, payloadHash);
+    if (existing) {
+      const ownJob = existing.team_id === teamId;
+      log.info(
+        { conflictJobId: existing.id, ownJob, teamId },
+        "V1 envelope rejected: duplicate payload hash",
+      );
+      return {
+        ok: false,
+        statusCode: 409,
+        response: {
+          error: "Conflict",
+          code: "DUPLICATE_INTENT",
+          message: "An intent with the same payload hash is already queued or in progress",
+          // Disclosed only when the caller already owns the job.
+          ...(ownJob ? { jobId: existing.id, status: existing.status } : {}),
+          failureStage: RelayerFailureStage.Validation,
+        },
+      };
+    }
+
+    const sender = envelope.signature?.publicKey ?? "";
+    const nonce = envelope.signature?.nonce ?? 0;
+    if (sender && nonce) {
+      const nonceReplay = await findJobByIntentSenderNonce(supabase, sender, String(nonce));
+      if (nonceReplay) {
+        const ownJob = nonceReplay.team_id === teamId;
+        markAbuse(ip);
+        log.info(
+          { conflictJobId: nonceReplay.id, ownJob, teamId },
+          "V1 envelope rejected: sender+nonce replay",
+        );
+        return {
+          ok: false,
+          statusCode: 409,
+          response: {
+            error: "Conflict",
+            code: "DUPLICATE_INTENT",
+            message: "An intent with the same sender and nonce already exists",
+            ...(ownJob ? { jobId: nonceReplay.id, status: nonceReplay.status } : {}),
+            failureStage: RelayerFailureStage.Validation,
+          },
+        };
       }
-      return reply.status(202).send(result.response);
+    }
+
+    const jobId = randomUUID();
+
+    // Every intent reaching this point requires a transaction — the guard above
+    // returned 501 for anything else, so txBytes is guaranteed present by
+    // validateV1Envelope's TRANSACTION_REQUIRED check.
+    const creditRpc = await supabase
+      .rpc("try_consume_credit", { p_team_id: teamId });
+    const creditResult = (creditRpc.data ?? null) as { has_credit: boolean; degraded: boolean } | null;
+
+    const degraded = !creditResult || !creditResult.has_credit;
+
+    if (degraded) {
+      const shuntResult = await processShunt(txBytes!, envelope, config, log);
+
+      if (!shuntResult.ok) {
+        log.warn({ teamId, jobId, error: shuntResult.error }, "Shunt processing failed — marking job as failed");
+
+        await insertJob(supabase, log, {
+          id: jobId,
+          status: "failed",
+          payload_hash: payloadHash,
+          payload: txBytes!,
+          intent_sender: sender || null,
+          intent_nonce: nonce ? String(nonce) : null,
+          intent_type: envelope.intent.toUpperCase(),
+          intent_currency: (envelope.payload?.asset as string) ?? null,
+          intent_envelope: JSON.stringify(envelope),
+          team_id: teamId,
+          degraded: true,
+        });
+
+        await updateJobStatus(supabase, log, jobId, {
+          status: "failed",
+          last_error: shuntResult.error,
+          rpc_endpoint_used: config.PUBLIC_RPC_URL,
+        });
+
+        clearAbuse(ip);
+
+        return {
+          ok: false,
+          statusCode: 500,
+          response: {
+            error: "Internal Server Error",
+            code: "SHUNT_FAILED",
+            message: "Degraded processing failed. Please retry.",
+            jobId,
+          },
+        };
+      }
+
+      await insertJob(supabase, log, {
+        id: jobId,
+        status: "shunted",
+        payload_hash: payloadHash,
+        payload: txBytes!,
+        intent_sender: sender || null,
+        intent_nonce: nonce ? String(nonce) : null,
+        intent_type: envelope.intent.toUpperCase(),
+        intent_currency: (envelope.payload?.asset as string) ?? null,
+        intent_envelope: JSON.stringify(envelope),
+        team_id: teamId,
+        degraded: true,
+      });
+
+      await updateJobStatus(supabase, log, jobId, {
+        status: "shunted",
+        tx_signature: shuntResult.signature,
+        rpc_endpoint_used: config.PUBLIC_RPC_URL,
+      });
+
+      clearAbuse(ip);
+      log.info({ jobId, payloadHash, intent: envelope.intent, degraded: true }, "V1 envelope shunted");
+
+      return {
+        ok: true,
+        response: { jobId, status: "shunted" as const },
+      };
+    }
+
+    await insertJob(supabase, log, {
+      id: jobId,
+      status: "queued",
+      payload_hash: payloadHash,
+      payload: txBytes!,
+      intent_sender: sender || null,
+      intent_nonce: nonce ? String(nonce) : null,
+      intent_type: envelope.intent.toUpperCase(),
+      intent_currency: (envelope.payload?.asset as string) ?? null,
+      intent_envelope: JSON.stringify(envelope),
+      team_id: teamId,
+      degraded: false,
+    });
+    await queue.add("broadcast", { jobId, type: "intent" } as BroadcastJobData, { jobId });
+    clearAbuse(ip);
+    log.info({ jobId, payloadHash, intent: envelope.intent, teamId }, "V1 envelope queued");
+
+    return {
+      ok: true,
+      response: { jobId, status: "queued" },
+    };
+  };
+
+  app.post<{ Body: Record<string, unknown> }>(
+    "/v1/intents",
+    async (request: FastifyRequest<{ Body: Record<string, unknown> }>, reply: FastifyReply) => {
+      const body = request.body ?? {};
+      const ip = getClientIp(request);
+
+      if (body.payload && typeof body.payload === "string") {
+        if (body.version) {
+          markAbuse(ip);
+          return reply.status(400).send({
+            error: "Bad Request",
+            code: "AMBIGUOUS_FORMAT",
+            message: "Request contains both 'payload' (legacy base64) and 'version' (JSON envelope). Use only one format.",
+            failureStage: RelayerFailureStage.Validation,
+          });
+        }
+        reply.header("Deprecation-Warning", "The base64 payload format is deprecated. Migrate to the v1 JSON envelope format (see https://docs.zypp.fun/relayer-v2).");
+        const result = await submitLegacyIntent(body.payload as string, ip, request.teamId!);
+        if (!result.ok) {
+          return reply.status(result.statusCode).send(result.response);
+        }
+        return reply.status(202).send(result.response);
+      }
+
+      if (body.version) {
+        const version = Number(body.version);
+        if (version === 1) {
+          const result = await submitV1Envelope(body, ip, request.teamId!);
+          if (!result.ok) {
+            return reply.status(result.statusCode).send(result.response);
+          }
+          return reply.status(202).send(result.response);
+        }
+        markAbuse(ip);
+        return reply.status(400).send({
+          error: "Bad Request",
+          code: "UNSUPPORTED_VERSION",
+          message: `Unsupported version ${version}, max supported: 1`,
+          failureStage: RelayerFailureStage.Validation,
+        });
+      }
+
+      markAbuse(ip);
+      return reply.status(400).send({
+        error: "Bad Request",
+        code: "INVALID_BODY",
+        message: "Body must include 'payload' (base64 string) or 'version' (JSON envelope)",
+        failureStage: RelayerFailureStage.Validation,
+      });
     }
   );
 
-  app.post<{ Body: { payloads: string[] } }>(
+  app.post<{ Body: { payloads?: unknown[] } }>(
     "/v1/intents/batch",
-    async (request: FastifyRequest<{ Body: { payloads: string[] } }>, reply: FastifyReply) => {
+    async (request: FastifyRequest<{ Body: { payloads?: unknown[] } }>, reply: FastifyReply) => {
       const ip = getClientIp(request);
       const payloads = request.body?.payloads;
       if (!Array.isArray(payloads) || payloads.length === 0 || payloads.length > BATCH_MAX_ITEMS) {
@@ -230,19 +541,40 @@ export async function registerRoutes(
           error: "Bad Request",
           code: "INVALID_BODY",
           message: `Body must include payloads array with 1-${BATCH_MAX_ITEMS} items`,
+          failureStage: RelayerFailureStage.Validation,
         });
       }
 
       const results: Array<Record<string, unknown>> = [];
       let accepted = 0;
-      for (const payload of payloads) {
-        const result = await submitIntent(payload, ip);
-        if (result.ok) {
-          accepted += 1;
-          results.push({ statusCode: 202, ...result.response });
+      let hasLegacy = false;
+      const teamId = request.teamId!;
+      for (const item of payloads) {
+        if (typeof item === "string") {
+          hasLegacy = true;
+          const result = await submitLegacyIntent(item, ip, teamId);
+          if (result.ok) {
+            accepted += 1;
+            results.push({ statusCode: 202, ...result.response });
+          } else {
+            results.push({ statusCode: result.statusCode, ...result.response });
+          }
+        } else if (item && typeof item === "object" && "version" in (item as Record<string, unknown>)) {
+          const result = await submitV1Envelope(item as Record<string, unknown>, ip, teamId);
+          if (result.ok) {
+            accepted += 1;
+            results.push({ statusCode: 202, ...result.response });
+          } else {
+            results.push({ statusCode: result.statusCode, ...result.response });
+          }
         } else {
-          results.push({ statusCode: result.statusCode, ...result.response });
+          markAbuse(ip);
+          results.push({ statusCode: 400, error: "Bad Request", code: "INVALID_ITEM", message: "Each item must be a base64 string (legacy) or a JSON object with a version field", failureStage: RelayerFailureStage.Validation });
         }
+      }
+
+      if (hasLegacy) {
+        reply.header("Deprecation-Warning", "The base64 payload format is deprecated. Migrate to the v1 JSON envelope format (see https://docs.zypp.fun/relayer-v2).");
       }
 
       return reply.status(accepted > 0 ? 207 : 400).send({
@@ -253,62 +585,11 @@ export async function registerRoutes(
     }
   );
 
-  app.post<{
-    Body: { transaction: string };
-  }>("/v1/transactions", async (request: FastifyRequest<{ Body: { transaction: string } }>, reply: FastifyReply) => {
-    const body = request.body;
-    if (!body || typeof body.transaction !== "string") {
-      markAbuse(getClientIp(request));
-      return reply.status(400).send({
-        error: "Bad Request",
-        code: "INVALID_BODY",
-        message: "Body must include 'transaction' (base64 string)",
-      });
-    }
-    const validation = validateTransaction(body.transaction, log);
-    if (!validation.ok) {
-      markAbuse(getClientIp(request));
-      return reply.status(400).send({
-        error: "Bad Request",
-        code: validation.code,
-        message: validation.message,
-      });
-    }
-
-    const { payload, payloadHash } = validation;
-    const existing = await findJobByPayloadHash(supabase, payloadHash);
-    if (existing) {
-      return reply.status(409).send({
-        error: "Conflict",
-        code: "DUPLICATE_TRANSACTION",
-        message: "A job with the same transaction is already queued or in progress",
-        jobId: existing.id,
-        status: existing.status,
-      });
-    }
-
-    const jobId = randomUUID();
-    await insertJob(supabase, log, {
-      id: jobId,
-      status: "queued",
-      payload_hash: payloadHash,
-      payload,
-    });
-
-    await queue.add("broadcast", { jobId } as BroadcastJobData, { jobId });
-
-    log.info({ jobId, payloadHash }, "Transaction queued");
-    return reply.status(202).send({
-      jobId,
-      status: "queued",
-    });
-  });
-
   app.get<{
     Params: { jobId: string };
   }>("/v1/transactions/:jobId", async (request: FastifyRequest<{ Params: { jobId: string } }>, reply: FastifyReply) => {
     const { jobId } = request.params;
-    const job = await getJobById(supabase, jobId);
+    const job = await getJobByIdForTeam(supabase, jobId, request.teamId!);
     if (!job) {
       return reply.status(404).send({
         error: "Not Found",
@@ -330,16 +611,47 @@ export async function registerRoutes(
 
   app.get<{
     Params: { jobId: string };
+  }>("/v1/intents/:jobId", async (request: FastifyRequest<{ Params: { jobId: string } }>, reply: FastifyReply) => {
+    const { jobId } = request.params;
+    const job = await getJobByIdForTeam(supabase, jobId, request.teamId!);
+    if (!job) {
+      return reply.status(404).send({
+        error: "Not Found",
+        code: "JOB_NOT_FOUND",
+        message: "Job not found",
+      });
+    }
+    const payload: Record<string, unknown> = {
+      jobId: job.id,
+      status: job.status,
+      retryCount: job.retry_count,
+      lastError: job.last_error,
+      createdAt: job.created_at.toISOString(),
+      updatedAt: job.updated_at.toISOString(),
+    };
+    if (job.tx_signature) payload.txSignature = job.tx_signature;
+    if (job.failure_stage) payload.failureStage = job.failure_stage;
+    if (job.failure_code) payload.failureCode = job.failure_code;
+    if (job.degraded) payload.degraded = true;
+    return reply.send(payload);
+  });
+
+  app.get<{
+    Params: { jobId: string };
   }>("/v1/transactions/:jobId/stream", async (request, reply) => {
     const { jobId } = request.params;
+    const teamId = request.teamId!;
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
 
+    // Scoped per poll, not once at open: a job's ownership cannot change, but
+    // re-checking keeps the authorisation decision colocated with every read
+    // rather than relying on a check that happened seconds or minutes earlier.
     const send = async () => {
-      const job = await getJobById(supabase, jobId);
+      const job = await getJobByIdForTeam(supabase, jobId, teamId);
       const event = JSON.stringify(
         job
           ? {
@@ -370,17 +682,32 @@ export async function registerRoutes(
     request.raw.on("close", () => clearInterval(timer));
   });
 
-  app.get("/v1/ops/metrics", async (_request, reply) => {
-    const metrics = await getOpsMetrics(supabase);
+  // Scoped to the calling team. This previously served platform-wide aggregates
+  // — every team's job counts and confirmed-transfer economics — to any caller
+  // holding a valid API key.
+  app.get("/v1/ops/metrics", async (request, reply) => {
+    const teamId = request.teamId!;
+    const metrics = await getOpsMetricsForTeam(supabase, teamId);
+    const { count: shunted } = await supabase
+      .from("jobs")
+      .select("id", { count: "exact", head: true })
+      .eq("team_id", teamId)
+      .eq("degraded", true);
     return reply.send({
       ...metrics,
-      abuseTrackedIps: abuseByIp.size,
+      shunted: shunted ?? 0,
+      // Deliberately omits abuseTrackedIps: that is a process-wide count
+      // reflecting all traffic to this instance, not the caller's own activity.
     });
   });
 
+  // Scoped to the calling team. This previously returned every team's recent
+  // jobs, including intent_sender, fee economics, and tx signatures — and the
+  // job ids it disclosed unlocked the by-id endpoints above.
   app.get("/v1/ops/transactions", async (request: FastifyRequest<{ Querystring: { limit?: string } }>, reply) => {
-    const limit = request.query.limit ? parseInt(request.query.limit, 10) : 20;
-    const jobs = await getRecentJobs(supabase, isNaN(limit) ? 20 : limit);
+    const parsed = request.query.limit ? parseInt(request.query.limit, 10) : 20;
+    const limit = Number.isNaN(parsed) ? 20 : Math.min(Math.max(parsed, 1), 100);
+    const jobs = await getRecentJobsForTeam(supabase, request.teamId!, limit);
     return reply.send({
       transactions: jobs
     });

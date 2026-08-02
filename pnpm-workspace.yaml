@@ -1,0 +1,7 @@
+allowBuilds:
+  bigint-buffer: true
+  bufferutil: true
+  esbuild: true
+  msgpackr-extract: true
+  utf-8-validate: true
+onlyBuiltDependencies: '["bigint-buffer","bufferutil","esbuild","msgpackr-extract","utf-8-validate"]'

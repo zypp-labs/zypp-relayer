@@ -32,6 +32,11 @@ export async function insertJob(
         intent_fee: job.intent_fee ?? null,
         intent_total: job.intent_total ?? null,
         intent_currency: job.intent_currency ?? null,
+        failure_stage: job.failure_stage ?? null,
+        failure_code: job.failure_code ?? null,
+        intent_envelope: job.intent_envelope ?? null,
+        team_id: job.team_id ?? null,
+        degraded: job.degraded ?? false,
       },
     ])
     .select()
@@ -43,6 +48,13 @@ export async function insertJob(
   return data as JobRow;
 }
 
+/**
+ * Fetch a job by id with no tenant filter.
+ *
+ * For internal/worker use only, where the caller is the system itself and there
+ * is no requesting team. API request handlers must use `getJobByIdForTeam` —
+ * serving this result to an API caller leaks other tenants' jobs.
+ */
 export async function getJobById(
   supabase: SupabaseClient,
   jobId: string
@@ -51,6 +63,31 @@ export async function getJobById(
     .from("jobs")
     .select("*")
     .eq("id", jobId)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) return null;
+  data.payload = fromBytea(data.payload);
+  return data as JobRow;
+}
+
+/**
+ * Fetch a job by id, scoped to the owning team.
+ *
+ * Returns null both when the job does not exist and when it belongs to another
+ * team, so callers cannot distinguish the two — a 404 for someone else's job
+ * must not confirm that the id is real.
+ */
+export async function getJobByIdForTeam(
+  supabase: SupabaseClient,
+  jobId: string,
+  teamId: string
+): Promise<JobRow | null> {
+  const { data, error } = await supabase
+    .from("jobs")
+    .select("*")
+    .eq("id", jobId)
+    .eq("team_id", teamId)
     .maybeSingle();
 
   if (error) throw error;
@@ -106,10 +143,81 @@ export async function getOpsMetrics(supabase: SupabaseClient) {
   return data;
 }
 
+/**
+ * Per-team job counts and confirmed-transfer economics.
+ *
+ * The `get_ops_metrics()` RPC aggregates every row in `jobs` regardless of
+ * owner, so it cannot be served to an API caller. This computes the same shape
+ * from a team-scoped read.
+ */
+export async function getOpsMetricsForTeam(
+  supabase: SupabaseClient,
+  teamId: string,
+) {
+  const { data, error } = await supabase
+    .from("jobs")
+    .select("status, intent_fee, intent_total")
+    .eq("team_id", teamId);
+
+  if (error) throw error;
+  const rows = (data ?? []) as Array<{
+    status: JobStatus;
+    intent_fee: string | null;
+    intent_total: string | null;
+  }>;
+
+  const countOf = (s: JobStatus) => rows.filter((r) => r.status === s).length;
+  const confirmed = rows.filter((r) => r.status === "confirmed");
+  const sum = (pick: (r: (typeof rows)[number]) => string | null) =>
+    confirmed.reduce((total, r) => {
+      const v = pick(r);
+      return v === null ? total : total + Number(v);
+    }, 0);
+
+  const feesCollected = sum((r) => r.intent_fee);
+  const withFee = confirmed.filter((r) => r.intent_fee !== null).length;
+
+  return {
+    counts: {
+      queued: String(countOf("queued")),
+      sent: String(countOf("sent")),
+      confirmed: String(confirmed.length),
+      failed: String(countOf("failed")),
+      total: String(rows.length),
+    },
+    economics: {
+      fees_collected_usdc: String(feesCollected),
+      transfer_total_usdc: String(sum((r) => r.intent_total)),
+      avg_confirmed_fee_usdc: String(withFee > 0 ? feesCollected / withFee : 0),
+    },
+  };
+}
+
+/**
+ * Recent jobs with no tenant filter — internal/ops use only.
+ * API request handlers must use `getRecentJobsForTeam`.
+ */
 export async function getRecentJobs(supabase: SupabaseClient, limit = 20) {
   const { data, error } = await supabase
     .from("jobs")
     .select("id, status, payload_hash, intent_sender, intent_nonce, intent_type, intent_fee, intent_total, intent_currency, tx_signature, rpc_endpoint_used, last_error, created_at, updated_at")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return data;
+}
+
+/** Recent jobs for one team. */
+export async function getRecentJobsForTeam(
+  supabase: SupabaseClient,
+  teamId: string,
+  limit = 20,
+) {
+  const { data, error } = await supabase
+    .from("jobs")
+    .select("id, status, payload_hash, intent_sender, intent_nonce, intent_type, intent_fee, intent_total, intent_currency, tx_signature, rpc_endpoint_used, last_error, created_at, updated_at")
+    .eq("team_id", teamId)
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -131,6 +239,8 @@ export async function updateJobStatus(
   if (update.last_error !== undefined) payload.last_error = update.last_error;
   if (update.tx_signature !== undefined) payload.tx_signature = update.tx_signature;
   if (update.rpc_endpoint_used !== undefined) payload.rpc_endpoint_used = update.rpc_endpoint_used;
+  if (update.failure_stage !== undefined) payload.failure_stage = update.failure_stage;
+  if (update.failure_code !== undefined) payload.failure_code = update.failure_code;
 
   const { error } = await supabase
     .from("jobs")
@@ -215,10 +325,14 @@ export async function markJobFailed(
   log: Logger,
   jobId: string,
   lastError: string,
-  rpcEndpoint: string | null
+  rpcEndpoint: string | null,
+  failureStage?: string | null,
+  failureCode?: string | null,
 ): Promise<boolean> {
   const payload: any = { status: "failed", last_error: lastError, updated_at: new Date().toISOString() };
   if (rpcEndpoint) payload.rpc_endpoint_used = rpcEndpoint;
+  if (failureStage !== undefined) payload.failure_stage = failureStage;
+  if (failureCode !== undefined) payload.failure_code = failureCode;
 
   const { data, error } = await supabase
     .from("jobs")

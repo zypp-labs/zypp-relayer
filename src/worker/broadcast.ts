@@ -3,19 +3,12 @@ import {
   Commitment,
   SendOptions,
   Keypair,
-  Transaction as LegacyTransaction,
-  PublicKey,
 } from "@solana/web3.js";
-import {
-  createTransferCheckedInstruction,
-  getAssociatedTokenAddress,
-  createAssociatedTokenAccountInstruction,
-} from "@solana/spl-token";
 import type { Config } from "../lib/config.js";
 import type { Logger } from "../lib/logger.js";
 import { classifyError } from "./classify.js";
-import { Buffer } from "buffer";
-import { isTransferIntent, parseIntentPayload } from "../lib/validate.js";
+import { coSignAsFeePayer, type IntentEnvelope } from "../lib/feePayer.js";
+import { RelayerFailureStage, relayerFailure, type RelayerFailure } from "../lib/failureCodes.js";
 
 export interface BroadcastResult {
   success: true;
@@ -28,92 +21,74 @@ export interface BroadcastFailure {
   retriable: boolean;
   message: string;
   rpcEndpoint?: string;
+  failure?: RelayerFailure;
 }
 
+/**
+ * Process an intent envelope by co-signing as fee payer and broadcasting.
+ *
+ * The caller (worker) extracts the partially-signed transaction and the
+ * validated intent envelope from the job payload. This function:
+ *
+ *   1. Deserializes the user's partially-signed VersionedTransaction
+ *   2. Calls coSignAsFeePayer() which enforces the verify-then-sign gate
+ *      (steps 1-9 in feePayer.ts — user sig MUST verify before co-sign)
+ *   3. Broadcasts the fully-signed transaction with RPC failover
+ *
+ * Unlike the v1 delegate-authority model, this function NEVER constructs
+ * transaction instructions. The user supplies the fully-formed transaction;
+ * the relayer only co-signs as fee payer and broadcasts.
+ */
 export async function processIntentAndBroadcast(
-  payload: Buffer,
+  partiallySignedTx: Buffer,
+  intentEnvelope: IntentEnvelope,
   config: Config,
-  log: Logger
+  log: Logger,
 ): Promise<BroadcastResult | BroadcastFailure> {
   try {
-    const parsed = parseIntentPayload(payload);
-    if (!parsed.ok) {
+    // Step A: Recover the fee payer keypair from config
+    const feePayerKey = config.FEE_PAYER_SECRET_KEY;
+    let feePayerKeypair: Keypair;
+    try {
+      const secretKey = Uint8Array.from(JSON.parse(feePayerKey));
+      feePayerKeypair = Keypair.fromSecretKey(secretKey);
+    } catch {
       return {
         success: false,
         retriable: false,
-        message: `${parsed.code}: ${parsed.message}`,
+        message: "FEE_PAYER_KEY_INVALID: Failed to parse fee payer secret key from config",
       };
     }
-    const { intent } = parsed.bundle;
 
-    const endpoints = config.RPC_URLS;
-    const commitment = config.RPC_CONFIRMATION_COMMITMENT as Commitment;
-    const connection = new Connection(endpoints[0], commitment);
+    // Step B: Co-sign with verify-then-sign gate (HARD GATE)
+    // If the user's signature is invalid, or the instructions don't
+    // match the declared intent, or the blockhash is missing — this
+    // returns { ok: false } and we never reach the broadcast step.
+    const coSignResult = coSignAsFeePayer(
+      partiallySignedTx,
+      intentEnvelope,
+      feePayerKeypair,
+    );
 
-    // 1. Setup Sponsor (Relayer)
-    const sponsorKey = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(config.RELAYER_SECRET_KEY)));
-    const usdcMint = new PublicKey(config.USDC_MINT_ADDRESS);
-    const hotWallet = new PublicKey(config.HOT_WALLET_ADDRESS);
-    const sender = new PublicKey(intent.sender);
-
-    const { blockhash } = await connection.getLatestBlockhash();
-
-    // Create the real transaction
-    const tx = new LegacyTransaction({
-      feePayer: sponsorKey.publicKey,
-      recentBlockhash: blockhash,
-    });
-
-    // 2. Handle different intent types
-    if (!isTransferIntent(intent)) {
-      log.info({ userId: intent.sender }, "Processing gasless USDC initialization");
-      const associatedTokenAddress = await getAssociatedTokenAddress(usdcMint, sender);
-
-      tx.add(
-        createAssociatedTokenAccountInstruction(
-          sponsorKey.publicKey, // Payer (Relayer)
-          associatedTokenAddress,
-          sender,
-          usdcMint
-        )
+    if (!coSignResult.ok) {
+      log.warn(
+        {
+          stage: coSignResult.failure.stage,
+          code: coSignResult.failure.code,
+          message: coSignResult.failure.message,
+        },
+        "Fee-payer co-sign rejected",
       );
-    } else {
-      // Default: USDC Transfer
-      const receiver = new PublicKey(intent.receiver);
-      const senderAta = await getAssociatedTokenAddress(usdcMint, sender);
-      const receiverAta = await getAssociatedTokenAddress(usdcMint, receiver);
-      const hotWalletAta = await getAssociatedTokenAddress(usdcMint, hotWallet);
-
-      // Use hotWallet (relayer) as the delegate authority
-      tx.add(
-        createTransferCheckedInstruction(
-          senderAta,
-          usdcMint,
-          receiverAta,
-          hotWallet, // Using relayer's hot wallet as delegate authority
-          BigInt(Math.floor(intent.amount * 1_000_000)), // USDC 6 decimals
-          6
-        )
-      );
-
-      // Add Fee Transfer ($0.01)
-      tx.add(
-        createTransferCheckedInstruction(
-          senderAta,
-          usdcMint,
-          hotWalletAta,
-          hotWallet, // Using relayer's hot wallet as delegate authority
-          BigInt(Math.floor(intent.fee * 1_000_000)),
-          6
-        )
-      );
+      return {
+        success: false,
+        retriable: coSignResult.failure.retriable,
+        message: `${coSignResult.failure.code}: ${coSignResult.failure.message}`,
+        failure: coSignResult.failure,
+      };
     }
 
-    // 3. Combine Signatures
-    tx.partialSign(sponsorKey);
-
-    // Broadcast the assembled transaction
-    return await broadcastWithFailover(tx.serialize(), config, log);
+    // Step C: Broadcast with failover
+    return await broadcastWithFailover(coSignResult.tx, config, log);
   } catch (e) {
     return {
       success: false,
@@ -126,7 +101,7 @@ export async function processIntentAndBroadcast(
 export async function broadcastWithFailover(
   payload: Buffer,
   config: Config,
-  log: Logger
+  log: Logger,
 ): Promise<BroadcastResult | BroadcastFailure> {
   const endpoints = config.RPC_URLS;
   const commitment = config.RPC_CONFIRMATION_COMMITMENT as Commitment;
@@ -142,7 +117,7 @@ export async function broadcastWithFailover(
         payload,
         commitment,
         timeout,
-        log
+        log,
       );
       if (result.success) return result;
       if (!result.retriable) return result;
@@ -158,17 +133,29 @@ export async function broadcastWithFailover(
           retriable: false,
           message: lastError.message,
           rpcEndpoint: endpoint,
+          failure: relayerFailure(
+            RelayerFailureStage.Broadcast,
+            "BROADCAST_PERMANENT",
+            lastError.message,
+          ),
         };
       }
       log.warn({ err: e, endpoint }, "RPC attempt failed, trying next");
     }
   }
 
+  const allFailedMsg = lastError?.message ?? "All RPC endpoints failed";
   return {
     success: false,
     retriable: true,
-    message: lastError?.message ?? "All RPC endpoints failed",
+    message: allFailedMsg,
     rpcEndpoint: lastEndpoint,
+    failure: relayerFailure(
+      RelayerFailureStage.Broadcast,
+      "ALL_RPCS_FAILED",
+      allFailedMsg,
+      true,
+    ),
   };
 }
 
@@ -177,7 +164,7 @@ async function tryBroadcastOne(
   payload: Buffer,
   commitment: Commitment,
   timeoutMs: number,
-  log: Logger
+  log: Logger,
 ): Promise<BroadcastResult | BroadcastFailure> {
   const connection = new Connection(endpoint, { commitment });
 
@@ -190,11 +177,18 @@ async function tryBroadcastOne(
     } as SendOptions);
   } catch (e) {
     const category = classifyError(e);
+    const message = e instanceof Error ? e.message : String(e);
     return {
       success: false,
       retriable: category === "retriable",
-      message: e instanceof Error ? e.message : String(e),
+      message,
       rpcEndpoint: endpoint,
+      failure: relayerFailure(
+        RelayerFailureStage.Broadcast,
+        category === "retriable" ? "BROADCAST_TRANSIENT" : "BROADCAST_PERMANENT",
+        message,
+        category === "retriable",
+      ),
     };
   }
 
@@ -204,7 +198,7 @@ async function tryBroadcastOne(
     signature,
     commitment,
     timeoutMs,
-    log
+    log,
   );
 
   if (confirmed === true) {
@@ -217,13 +211,26 @@ async function tryBroadcastOne(
       retriable: true,
       message: "Confirmation timed out (transaction may still land)",
       rpcEndpoint: endpoint,
+      failure: relayerFailure(
+        RelayerFailureStage.Confirmation,
+        "CONFIRMATION_TIMEOUT",
+        "Confirmation timed out (transaction may still land)",
+        true,
+      ),
     };
   }
+  const confirmedMsg = confirmed instanceof Error ? confirmed.message : String(confirmed);
   return {
     success: false,
     retriable: classifyError(confirmed) === "retriable",
-    message: confirmed instanceof Error ? confirmed.message : String(confirmed),
+    message: confirmedMsg,
     rpcEndpoint: endpoint,
+    failure: relayerFailure(
+      RelayerFailureStage.Confirmation,
+      "CONFIRMATION_FAILED",
+      confirmedMsg,
+      classifyError(confirmed) === "retriable",
+    ),
   };
 }
 
@@ -234,7 +241,7 @@ async function waitForConfirmation(
   signature: string,
   _commitment: Commitment,
   timeoutMs: number,
-  _log: Logger
+  _log: Logger,
 ): Promise<true | "expired" | Error> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {

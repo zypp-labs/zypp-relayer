@@ -17,6 +17,11 @@ export interface JobRow {
   intent_fee: string | null;
   intent_total: string | null;
   intent_currency: string | null;
+  failure_stage: string | null;
+  failure_code: string | null;
+  intent_envelope: string | null;
+  team_id: string | null;
+  degraded: boolean;
 }
 
 export interface JobInsert {
@@ -30,6 +35,11 @@ export interface JobInsert {
   intent_fee?: string | null;
   intent_total?: string | null;
   intent_currency?: string | null;
+  failure_stage?: string | null;
+  failure_code?: string | null;
+  intent_envelope?: string | null;
+  team_id?: string | null;
+  degraded?: boolean;
 }
 
 export interface JobStatusUpdate {
@@ -37,6 +47,8 @@ export interface JobStatusUpdate {
   last_error?: string | null;
   tx_signature?: string | null;
   rpc_endpoint_used?: string | null;
+  failure_stage?: string | null;
+  failure_code?: string | null;
   updated_at?: Date;
 }
 

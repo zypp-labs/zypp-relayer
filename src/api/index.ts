@@ -25,7 +25,7 @@ async function main() {
     },
   });
 
-  await registerRoutes(app, { supabase, queue, log, intentDomain: config.RELAYER_INTENT_DOMAIN });
+  await registerRoutes(app, { supabase, queue, log, intentDomain: config.RELAYER_INTENT_DOMAIN, config });
 
   app.listen({ port: config.PORT, host: "0.0.0.0" }, (err, address) => {
     if (err) {

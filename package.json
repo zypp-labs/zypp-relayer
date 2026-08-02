@@ -39,6 +39,9 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": ["bigint-buffer", "bufferutil", "esbuild", "msgpackr-extract", "utf-8-validate"]
+  },
   "engines": {
     "node": ">=20"
   }

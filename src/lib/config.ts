@@ -24,11 +24,14 @@ const envSchema = z.object({
   BULL_MAX_ATTEMPTS: z.coerce.number().default(5),
   BULL_BACKOFF_MS: z.coerce.number().default(1000),
 
-  RELAYER_SECRET_KEY: z.string().min(1),
-  USDC_MINT_ADDRESS: z.string().min(1),
-  HOT_WALLET_ADDRESS: z.string().min(1),
+  FEE_PAYER_SECRET_KEY: z.string().min(1),
+  USDC_MINT_ADDRESS: z.string().optional(),
+  HOT_WALLET_ADDRESS: z.string().optional(),
   RELAYER_INTENT_DOMAIN: z.string().min(1),
   RELAYER_API_KEY: z.string().min(1).optional(),
+  PUBLIC_RPC_URL: z.string().url().optional(),
+  POLAR_ACCESS_TOKEN: z.string().optional(),
+  POLAR_WEBHOOK_SECRET: z.string().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
