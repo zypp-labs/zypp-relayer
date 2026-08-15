@@ -143,12 +143,53 @@ export async function getOpsMetrics(supabase: SupabaseClient) {
   return data;
 }
 
+/** Confirmed-transfer economics for one currency, all figures as strings. */
+export interface CurrencyEconomics {
+  /** Total relay fees collected, in this currency's own units. */
+  fees_collected: string;
+  /** Total value transferred, in this currency's own units. */
+  transfer_total: string;
+  /** Mean fee per confirmed transfer carrying a fee. */
+  avg_fee: string;
+  /** Confirmed transfers denominated in this currency. */
+  confirmed_count: string;
+}
+
 /**
- * Per-team job counts and confirmed-transfer economics.
+ * Per-team job counts and confirmed-transfer economics, broken down by currency.
  *
  * The `get_ops_metrics()` RPC aggregates every row in `jobs` regardless of
- * owner, so it cannot be served to an API caller. This computes the same shape
- * from a team-scoped read.
+ * owner, so it cannot be served to an API caller. This computes an equivalent
+ * shape from a team-scoped read.
+ *
+ * **Economics are grouped by `intent_currency`, not summed together.** The
+ * earlier version summed `intent_fee` and `intent_total` across all rows and
+ * labelled the results `fees_collected_usdc`. Those columns are mint-agnostic,
+ * so with more than one supported token that total mixed base units of
+ * different scales — adding a 6-decimal USDC figure to a 9-decimal SOL figure
+ * yields a number denominated in nothing, under a label asserting it is USDC.
+ *
+ * Rows with no `intent_currency` are grouped under `unknown` rather than
+ * dropped: omitting value from a financial aggregate is worse than reporting it
+ * as unattributed.
+ *
+ * ## What these numbers currently cover, and what they do not
+ *
+ * `intent_fee` and `intent_total` are written only by `submitLegacyIntent`
+ * (routes.ts), from the legacy schema's flat `fee`/`total` scalars. Two
+ * consequences worth knowing before quoting these figures:
+ *
+ *  - **The v1 path writes neither**, so every v1 payment contributes a confirmed
+ *    count with zero economics. That is to-be-fixed.md F3 gap 2, still open.
+ *  - **Neither reflects the signed `fees[]` list.** A payment may now settle
+ *    several fee transfers, each its own on-chain instruction to its own
+ *    destination; a single `intent_fee` scalar cannot represent that. Once the
+ *    construction path is wired in, these columns should be replaced by a sum
+ *    over the fee entries that were actually broadcast — read from
+ *    `intent_envelope`, which stores the whole signed payload — rather than
+ *    extended with more scalars that can only describe one fee.
+ *
+ * Until then these are honest about the legacy path and silent about the rest.
  */
 export async function getOpsMetricsForTeam(
   supabase: SupabaseClient,
@@ -156,7 +197,7 @@ export async function getOpsMetricsForTeam(
 ) {
   const { data, error } = await supabase
     .from("jobs")
-    .select("status, intent_fee, intent_total")
+    .select("status, intent_fee, intent_total, intent_currency")
     .eq("team_id", teamId);
 
   if (error) throw error;
@@ -164,18 +205,38 @@ export async function getOpsMetricsForTeam(
     status: JobStatus;
     intent_fee: string | null;
     intent_total: string | null;
+    intent_currency: string | null;
   }>;
 
   const countOf = (s: JobStatus) => rows.filter((r) => r.status === s).length;
   const confirmed = rows.filter((r) => r.status === "confirmed");
-  const sum = (pick: (r: (typeof rows)[number]) => string | null) =>
-    confirmed.reduce((total, r) => {
-      const v = pick(r);
-      return v === null ? total : total + Number(v);
-    }, 0);
 
-  const feesCollected = sum((r) => r.intent_fee);
-  const withFee = confirmed.filter((r) => r.intent_fee !== null).length;
+  const byCurrency: Record<string, CurrencyEconomics> = {};
+  for (const row of confirmed) {
+    const currency = row.intent_currency ?? "unknown";
+    const bucket = (byCurrency[currency] ??= {
+      fees_collected: "0",
+      transfer_total: "0",
+      avg_fee: "0",
+      confirmed_count: "0",
+    });
+
+    // Accumulate as numbers, stringify once at the end. These are decimal
+    // display figures (e.g. "0.01"), not base-unit integers, so Number is the
+    // right type here — unlike the spend ceilings, which are bigint.
+    bucket.fees_collected = String(Number(bucket.fees_collected) + Number(row.intent_fee ?? 0));
+    bucket.transfer_total = String(Number(bucket.transfer_total) + Number(row.intent_total ?? 0));
+    bucket.confirmed_count = String(Number(bucket.confirmed_count) + 1);
+  }
+
+  // Mean over rows that actually carried a fee, so rows without one do not
+  // drag the average toward zero.
+  for (const [currency, bucket] of Object.entries(byCurrency)) {
+    const withFee = confirmed.filter(
+      (r) => (r.intent_currency ?? "unknown") === currency && r.intent_fee !== null,
+    ).length;
+    bucket.avg_fee = String(withFee > 0 ? Number(bucket.fees_collected) / withFee : 0);
+  }
 
   return {
     counts: {
@@ -183,13 +244,11 @@ export async function getOpsMetricsForTeam(
       sent: String(countOf("sent")),
       confirmed: String(confirmed.length),
       failed: String(countOf("failed")),
+      acknowledged: String(countOf("acknowledged")),
+      shunted: String(countOf("shunted")),
       total: String(rows.length),
     },
-    economics: {
-      fees_collected_usdc: String(feesCollected),
-      transfer_total_usdc: String(sum((r) => r.intent_total)),
-      avg_confirmed_fee_usdc: String(withFee > 0 ? feesCollected / withFee : 0),
-    },
+    by_currency: byCurrency,
   };
 }
 

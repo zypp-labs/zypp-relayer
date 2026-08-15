@@ -1,7 +1,7 @@
-import { Connection, Keypair } from "@solana/web3.js";
+import { Connection } from "@solana/web3.js";
 import type { Config } from "./config.js";
 import type { Logger } from "./logger.js";
-import { coSignAsFeePayer, type IntentEnvelope } from "./feePayer.js";
+import { coSignAsFeePayerWithKeys, loadFeePayerKeypairs, type IntentEnvelope } from "./feePayer.js";
 
 export interface ShuntSuccess {
   ok: true;
@@ -24,15 +24,14 @@ export async function processShunt(
     return { ok: false, error: "PUBLIC_RPC_URL not configured — shunt path unavailable" };
   }
 
-  let feePayerKeypair: Keypair;
+  let keys: ReturnType<typeof loadFeePayerKeypairs>;
   try {
-    const secretKey = Uint8Array.from(JSON.parse(config.FEE_PAYER_SECRET_KEY));
-    feePayerKeypair = Keypair.fromSecretKey(secretKey);
+    keys = loadFeePayerKeypairs(config);
   } catch {
     return { ok: false, error: "FEE_PAYER_KEY_INVALID: Failed to parse fee payer secret key" };
   }
 
-  const coSignResult = coSignAsFeePayer(partiallySignedTx, intentEnvelope, feePayerKeypair);
+  const coSignResult = coSignAsFeePayerWithKeys(partiallySignedTx, intentEnvelope, keys.keypairs);
   if (!coSignResult.ok) {
     return {
       ok: false,

@@ -1,0 +1,350 @@
+# Render Blueprint — the deploy definition, in the repo rather than the dashboard.
+#
+# Before this file the only description of how ZRN runs in production lived in
+# Render's UI: nothing in git said what the start command was, which environment
+# variables existed, or that migrations had to be applied at all. `fly.toml` had
+# been deleted and the Dockerfile still claimed Fly.io, so the repo actively
+# misdescribed where it was deployed.
+#
+# ── Read this before applying ──
+#
+# 1. FREE TIER, so migrations run from `startCommand`, not `preDeployCommand`.
+#    Render's pre-deploy hook — the correct place for this, since it runs after
+#    the build and before any traffic reaches the new version — needs a paid
+#    instance. On free it is silently ignored: no error, the migration simply
+#    never runs. Folding it into the start command is the workaround, and its
+#    consequences are spelled out on that line below.
+#
+# 2. THE WORKER PROBABLY CANNOT BE FREE. Render's free tier covers web services,
+#    static sites, cron jobs and Postgres; background workers are, as far as I
+#    know, paid-only. It is declared `plan: starter` below for that reason. If
+#    applying this fails on the worker, that is why — see the note there for the
+#    options.
+#
+# 3. Applying a blueprint matches services by `name`. Existing services with
+#    different names are not adopted; Render creates new ones alongside them.
+#
+# 4. No `rootDir`. This repo's root IS zypp-relayer/ (it has its own .git); the
+#    zypp-labs/ directory above it is not part of the repo. A
+#    `rootDir: zypp-relayer` would point Render at a path that does not exist.
+#
+# 5. Every `sync: false` value must be set once in the dashboard. Render prompts
+#    for them on first apply and never writes them into git — which is the whole
+#    reason they are marked rather than given here.
+
+services:
+  # ── API ──
+  - type: web
+    name: zypp-relayer
+    runtime: node
+    plan: free
+
+    # Nearest EU option to the database. The Supabase pooler is aws-1-eu-west-3
+    # (Paris), which Render does not offer; Frankfurt is a few ms away, Oregon is
+    # ~150. Ingress makes several round trips to Postgres before it can answer,
+    # so that gap is multiplied on every request.
+    #
+    # Region is fixed at creation and cannot be changed later.
+    region: frankfurt
+    branch: main
+
+    # Explicit rather than left to auto-detection. A stale `package-lock.json`
+    # (April, unmaintained) sits next to `pnpm-lock.yaml`, and auto-detection is
+    # free to pick npm — which would resolve dependencies fresh instead of
+    # installing the versions that were tested. `packageManager` in package.json
+    # pins which pnpm corepack activates.
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm run build
+
+    # Migrations run here because `preDeployCommand` does nothing on free (note 1).
+    #
+    # `migrate:deploy`, not `migrate` — the latter runs through tsx, a dev
+    # dependency that is not installed in a production build.
+    #
+    # What this costs, all of which is acceptable but none of which is invisible:
+    #
+    #   - It runs on every start, including every wake from spin-down. That is
+    #     cheap only because src/store/migrate.ts now tracks applied migrations
+    #     in `schema_migrations`; a run with nothing new is a handful of SELECTs.
+    #     Before that change this would have replayed all nine files on every
+    #     cold start.
+    #   - `&&`, so a failed migration means the server never binds. That is the
+    #     right call — serving against a schema that failed to apply is worse —
+    #     but it does mean a transient Postgres blip during a wake shows up as a
+    #     service that will not start rather than as a slow request.
+    #   - Migrating and serving are no longer separable. On a paid plan, move
+    #     this back to `preDeployCommand` and restore `startCommand` to just
+    #     `pnpm run start`.
+    #
+    # Free instances also spin down after ~15 minutes idle and take tens of
+    # seconds to wake. For a relayer whose premise is settling payments under bad
+    # conditions, the first request after a quiet period paying that cost is a
+    # real limitation, not just a slow demo — and it is the strongest argument
+    # for moving the API to a paid instance before this carries live traffic.
+    startCommand: pnpm run migrate:deploy && pnpm run start
+
+    # Unauthenticated by deliberate exception (PUBLIC_ROUTES in
+    # src/api/routes.ts). It was previously behind the x-api-key hook, so this
+    # check could only ever have returned 401 — the reason it is listed here at
+    # all is that the exception now exists.
+    healthCheckPath: /health
+
+    # Already hardcoded in three route responses (`/` advertises it as base_url
+    # and docs, `/docs` 302s to it), so the service is wrong about itself until
+    # this resolves. Render still needs the DNS record created at the registrar:
+    # a CNAME for `relayer` pointing at the onrender.com hostname it assigns.
+    #
+    # Free instances get a certificate for custom domains, but they also spin
+    # down when idle — see the note on startCommand for what that costs here.
+    domains:
+      - relayer.zypp.fun
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+
+      # Corepack asks for confirmation before downloading a pinned package
+      # manager. There is no one to answer in a build container, and the prompt
+      # is what the build hangs or fails on.
+      - key: COREPACK_ENABLE_DOWNLOAD_PROMPT
+        value: "0"
+
+      # PORT is deliberately absent. Render injects it and config.ts reads it
+      # with a default; declaring it here would override the injected value and
+      # the service would bind to a port Render is not routing to — which
+      # presents as a health check that never passes.
+
+      # ── Secrets. Set in the dashboard, never here. ──
+      - key: DATABASE_URL
+        sync: false
+      # Supabase's pooler chain is rooted in Supabase's own CA, which Node does
+      # not trust — without this a verified connection fails with
+      # SELF_SIGNED_CERT_IN_CHAIN. Paste the whole PEM as the value: createPool
+      # accepts inline contents as well as a path, and there is no file to point
+      # at on Render. Prefer this over DATABASE_SSL_NO_VERIFY, which turns
+      # verification off rather than teaching Node who to trust.
+      - key: DATABASE_CA_CERT
+        sync: false
+      # External (Upstash, Redis Cloud, or an existing Render instance). Not
+      # declared as a managed service here — that would provision a second,
+      # empty one, and the worker would then read a different queue than the API
+      # writes to.
+      - key: REDIS_URL
+        sync: false
+      - key: NODE_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: RPC_URLS
+        sync: false
+      # NOT the HTTP hostname. This is the domain string clients bake into the
+      # message they sign, so it must match what the client uses exactly —
+      # changing it invalidates every intent already signed against the old
+      # value. It is unrelated to relayer.zypp.fun.
+      - key: RELAYER_INTENT_DOMAIN
+        sync: false
+      # Mandatory: config.ts declares it `z.string().min(1)`, so the API and the
+      # worker both refuse to start without it. A JSON byte array — the 64-byte
+      # ed25519 secret key, e.g. `[12,34,...]`, the contents of a Solana
+      # keyfile — not base58.
+      - key: FEE_PAYER_SECRET_KEY
+        sync: false
+      # Keys being rotated out. Removing this before the queue drains
+      # permanently invalidates every already-signed intent that names the old
+      # fee payer — see OPERATIONS.md.
+      - key: FEE_PAYER_LEGACY_SECRET_KEYS
+        sync: false
+      # The key users approve as delegate over their own token accounts.
+      #
+      # Deliberately NOT the same value as FEE_PAYER_SECRET_KEY, and the
+      # separation is the security property: the fee payer only ever spends the
+      # relayer's own SOL on fees and rent, while this key can move *other
+      # people's tokens* up to whatever allowance each user approved. One
+      # variable holding both roles would mean a leak of the fee-paying key also
+      # drains every delegated balance.
+      #
+      # Its public key must be the account users actually approved. An SPL
+      # approval names exactly one delegate and does not carry over, so rotating
+      # this requires every user to re-approve — treat it as a migration, not a
+      # config change.
+      #
+      # Same JSON byte-array format as the fee payer. Without it the service
+      # still boots and everything except relayer-constructed transfers works;
+      # settlement refuses loudly rather than falling back to another key.
+      - key: DELEGATE_SECRET_KEY
+        sync: false
+      # RELAYER_API_KEY is deliberately absent. Nothing server-side reads it:
+      # the auth hook in routes.ts takes `x-api-key` and looks the hash up in the
+      # `api_keys` table (findTeamByApiKey), with no fallback to a shared
+      # environment key. Its only remaining use is scripts/bench.ts, which runs
+      # from a laptop. Setting it here would imply the server honours a key it
+      # does not.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALERT_CHAT_ID
+        sync: false
+      - key: POLAR_ACCESS_TOKEN
+        sync: false
+      - key: POLAR_WEBHOOK_SECRET
+        sync: false
+      - key: PUBLIC_RPC_URL
+        sync: false
+      - key: USDC_MINT_ADDRESS
+        sync: false
+      - key: HOT_WALLET_ADDRESS
+        sync: false
+
+  # ── Broadcaster worker ──
+  #
+  # Separate service because it scales on queue depth while the API scales on
+  # request rate, and a worker restart must not drop in-flight HTTP requests.
+  #
+  # Without this deployed, nothing drains the BullMQ queue: the API accepts
+  # intents and returns 202 with a jobId, the rows sit at `queued`, and no
+  # transaction is ever broadcast. The failure is silent from the client's side —
+  # submission succeeds, settlement never happens.
+  #
+  # `plan: starter`, not free. Render's free tier does not offer background
+  # workers as far as I can tell. If applying this blueprint fails here, the
+  # options are: pay for this service (~$7/mo), or run the worker somewhere else
+  # entirely (any always-on host with REDIS_URL and the fee-payer key reaches the
+  # same queue — it does not have to live on Render). Running it as a Render cron
+  # job is not a substitute: BullMQ's Worker is a long-lived process, not
+  # something that does a unit of work and exits.
+  - type: worker
+    name: zypp-relayer-worker
+    runtime: node
+    plan: starter
+    region: frankfurt
+    branch: main
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm run build
+
+    # No migrate here. It runs once per deploy from the API's start command, and
+    # two services migrating at once is exactly the race the advisory lock in
+    # migrate.ts guards against — relying on that as routine is worse than not
+    # creating the race.
+    startCommand: pnpm run worker
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: COREPACK_ENABLE_DOWNLOAD_PROMPT
+        value: "0"
+
+      # Shared with the API. `fromService` keeps each of these one value rather
+      # than two that can drift: a worker pointed at a different Redis silently
+      # processes an empty queue while real jobs pile up unbroadcast, and a
+      # worker holding a different fee payer signs with a key the client never
+      # agreed to.
+      - key: REDIS_URL
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: REDIS_URL
+      - key: DATABASE_URL
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: DATABASE_URL
+      - key: DATABASE_CA_CERT
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: DATABASE_CA_CERT
+      - key: NODE_PUBLIC_SUPABASE_URL
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: NODE_PUBLIC_SUPABASE_URL
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: SUPABASE_SERVICE_ROLE_KEY
+      - key: RPC_URLS
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: RPC_URLS
+      - key: RELAYER_INTENT_DOMAIN
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: RELAYER_INTENT_DOMAIN
+      - key: FEE_PAYER_SECRET_KEY
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: FEE_PAYER_SECRET_KEY
+      - key: FEE_PAYER_LEGACY_SECRET_KEYS
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: FEE_PAYER_LEGACY_SECRET_KEYS
+      # Shared with the API so the two cannot diverge. The worker is the service
+      # that actually signs settlements, so a worker holding a different
+      # delegate than the one users approved would refuse every payment with
+      # DELEGATE_MISMATCH.
+      - key: DELEGATE_SECRET_KEY
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: DELEGATE_SECRET_KEY
+      # No RELAYER_API_KEY here either — see the note on the API service.
+      - key: TELEGRAM_BOT_TOKEN
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: TELEGRAM_BOT_TOKEN
+      - key: TELEGRAM_ALERT_CHAT_ID
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: TELEGRAM_ALERT_CHAT_ID
+      - key: PUBLIC_RPC_URL
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: PUBLIC_RPC_URL
+      - key: USDC_MINT_ADDRESS
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: USDC_MINT_ADDRESS
+      - key: HOT_WALLET_ADDRESS
+        fromService:
+          type: web
+          name: zypp-relayer
+          envVarKey: HOT_WALLET_ADDRESS
+
+# ── Moving to a paid plan later ──
+#
+# Two edits, both on the API service:
+#
+#   plan: free              ->  plan: starter
+#   startCommand: pnpm run migrate:deploy && pnpm run start
+#                           ->  preDeployCommand: pnpm run migrate:deploy
+#                               startCommand: pnpm run start
+#
+# That restores the ordering guarantee the free tier cannot give: the schema is
+# applied once, before the new version takes traffic, rather than on every
+# process start.
+#
+# ── If you go back to Docker ──
+#
+# The Dockerfile is current and correct (it copies migrations/, installs with
+# pnpm rather than npm, and runs the compiled migrate so tsx is not needed in
+# production). To use it, replace `runtime: node` and `buildCommand` on each
+# service with:
+#
+#     runtime: docker
+#     dockerfilePath: ./Dockerfile
+#     dockerContext: .
+#
+# `startCommand` still applies and runs inside the image. The native runtime is
+# the default here because it runs the same commands you run locally, so a build
+# break surfaces on your laptop instead of in a deploy log — and there is no
+# Docker on this machine to test the image with.

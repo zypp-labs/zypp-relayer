@@ -47,7 +47,7 @@ _Note: The core infrastructure and relayer system are proprietary and not open s
 - **Stateless Validation:** Validates payloads strictly (max 1232 bytes, valid Solana tx, signatures present).
 - **Replay Protection:** Duplicate payloads and nonces are actively rejected.
 - **Rate Limiting:** Built-in Redis-backed rate limiting per IP to prevent abuse.
-- **API Key Protection:** Endpoints are secured via `x-relayer-api-key`.
+- **API Key Protection:** Endpoints are secured via `x-api-key`. Keys are issued per team, stored only as a SHA-256 hash, and revocable.
 
 ## Status
 

@@ -62,6 +62,16 @@ export async function getTeamUsage(supabase: SupabaseClient, teamId: string): Pr
   return { current, limit: team.credits_limit, degraded };
 }
 
+/**
+ * Apply the monthly credit reset by hand.
+ *
+ * The scheduled path is `pg_cron` (migration 010), not this function — nothing in
+ * the service calls it, deliberately, so the reset does not depend on the relayer
+ * being up. This is the manual escape hatch for support.
+ *
+ * Safe to call at any time: since 010 the RPC skips teams already reset this
+ * month, so an out-of-band run tops up nobody who has not earned it.
+ */
 export async function resetMonthlyCredits(supabase: SupabaseClient, log: Logger): Promise<void> {
   const { error } = await supabase.rpc("reset_team_credits");
   if (error) throw error;

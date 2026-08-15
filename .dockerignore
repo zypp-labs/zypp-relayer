@@ -1,0 +1,37 @@
+# Kept deliberately as a denylist of things that must never enter the build
+# context, not just an optimisation. `docker build` uploads the whole context to
+# the daemon, and any later `COPY . .` would bake whatever is present into a
+# layer — where it survives even if a subsequent step deletes it.
+
+# Credentials. .env holds the database password; certs/ is where the Supabase CA
+# bundle lands.
+.env
+.env.*
+!.env.example
+certs/
+# `**/` is load-bearing: a leading `*.pem` is matched against the path from the
+# context root and does not cross `/`, so it would miss `config/server.pem`.
+**/*.pem
+**/*.key
+
+# Reinstalled from the lockfile inside the image; copying the host's copy would
+# also ship darwin-native binaries into a linux image.
+node_modules
+
+# Built in the builder stage.
+dist
+
+.git
+.gitignore
+**/*.log
+npm-debug.log*
+**/.DS_Store
+
+# Not part of the runtime image. Excluded from the context rather than relied on
+# `tsconfig` to skip: `pnpm run build` would compile them into dist/ otherwise,
+# and the fake credentials in pool.test.ts have no business in a shipped layer.
+**/*.test.ts
+Dockerfile
+.dockerignore
+README.md
+OPERATIONS.md
